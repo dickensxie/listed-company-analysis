@@ -1,0 +1,265 @@
+# -*- coding: utf-8 -*-
+"""
+sec_xbrl_api.py - SEC EDGAR XBRL财务数据API
+
+数据源：SEC Company Facts API
+优点：结构化数据，503+标准科目，免费无限制
+限制：Rate limit 10 req/s
+"""
+import os
+import json
+import time
+import requests
+from datetime import datetime
+from typing import Dict, List, Optional
+
+SEC_HEADERS = {
+    'User-Agent': 'Mozilla/5.0 (QCLaw Investment Research contact@qclaw.com)',
+    'Accept': 'application/json',
+}
+
+# Ticker到CIK映射
+TICKER_CIK_MAP = {
+    'AAPL': '0000320193', 'MSFT': '0000789019', 'GOOGL': '0001652044',
+    'GOOG': '0001652044', 'AMZN': '0001018724', 'META': '0001326801',
+    'NVDA': '0001045810', 'TSLA': '0001318605', 'JPM': '0000019617',
+    'JNJ': '0000200406', 'V': '0001403161', 'PG': '0000080424',
+    'HD': '0000354950', 'MA': '0001141391', 'DIS': '0001744489',
+    'BAC': '0000070858', 'KO': '0000021344', 'PEP': '0000077476',
+    'CSCO': '0001067983', 'COST': '0000909832', 'TMO': '0000911225',
+    'MRK': '0000310158', 'ABBV': '0001551152', 'ACN': '0001467373',
+    'CRM': '0001108524', 'NFLX': '0001065280', 'ADBE': '0000007967',
+    'AMD': '0000002488', 'INTC': '0000050863', 'NKE': '0000320187',
+    'ORCL': '0001341439', 'PYPL': '0001633917', 'QCOM': '0000804328',
+    'SBUX': '0000829224', 'TXN': '0000097476', 'WMT': '0000104169',
+    # 中概股
+    'BABA': '0001577552', 'JD': '0001549642', 'PDD': '0001737806',
+    'BIDU': '0001329080', 'NIO': '0001736531', 'BILI': '0001740602',
+    'TME': '0001810806', 'IQ': '0001747940', 'FUTU': '0001836133',
+}
+
+# 关键财务科目映射
+KEY_ITEMS = {
+    'revenue': 'RevenueFromContractWithCustomerExcludingAssessedTaxes',
+    'net_income': 'NetIncomeLoss',
+    'total_assets': 'Assets',
+    'total_equity': 'StockholdersEquity',
+    'cash': 'CashAndCashEquivalentsAtCarryingValue',
+    'eps_basic': 'EarningsPerShareBasic',
+    'shares_outstanding': 'WeightedAverageNumberOfSharesOutstandingBasic',
+    'gross_profit': 'GrossProfit',
+    'operating_income': 'OperatingIncomeLoss',
+    'rd_expense': 'ResearchAndDevelopmentExpense',
+    'sga_expense': 'SellingGeneralAndAdministrativeExpense',
+    'total_debt': 'LongTermDebt',
+    'interest_expense': 'InterestExpense',
+    'depreciation': 'Depreciation',
+    'capex': 'CapitalExpenditures',
+    'dividends': 'DividendsCash',
+    'ocf': 'CashFlowsFromUsedInOperatingActivities',
+}
+
+class SECXBRLAPI:
+    """SEC EDGAR XBRL API封装"""
+    
+    def __init__(self):
+        self.session = requests.Session()
+        self.session.headers.update(SEC_HEADERS)
+        self.last_request_time = 0
+        self.cache = {}
+    
+    def _rate_limit(self):
+        """Rate limiting: 10 requests/second"""
+        elapsed = time.time() - self.last_request_time
+        if elapsed < 0.1:
+            time.sleep(0.1 - elapsed)
+        self.last_request_time = time.time()
+    
+    def get_cik(self, ticker: str) -> Optional[str]:
+        """获取CIK"""
+        ticker = ticker.upper()
+        if ticker in TICKER_CIK_MAP:
+            return TICKER_CIK_MAP[ticker]
+        
+        # 尝试从SEC获取
+        self._rate_limit()
+        try:
+            url = f'https://data.sec.gov/submissions/CIK{ticker}.json'
+            r = self.session.get(url, timeout=30)
+            if r.status_code == 200:
+                data = r.json()
+                cik = str(data.get('cik', '')).zfill(10)
+                TICKER_CIK_MAP[ticker] = cik  # 缓存
+                return cik
+        except:
+            pass
+        
+        return None
+    
+    def get_company_facts(self, ticker: str) -> Dict:
+        """
+        获取公司所有XBRL财务数据
+        
+        Returns:
+            {
+                'success': bool,
+                'company': str,
+                'cik': str,
+                'financials': {...},
+                'warnings': []
+            }
+        """
+        result = {
+            'success': False,
+            'ticker': ticker,
+            'company': '',
+            'cik': '',
+            'financials': {},
+            'warnings': []
+        }
+        
+        # 获取CIK
+        cik = self.get_cik(ticker)
+        if not cik:
+            result['warnings'].append(f'未找到 {ticker} 的CIK')
+            return result
+        
+        result['cik'] = cik
+        
+        # 获取公司数据
+        self._rate_limit()
+        url = f"https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json"
+        
+        try:
+            r = self.session.get(url, timeout=30)
+            if r.status_code != 200:
+                result['warnings'].append(f'API请求失败: {r.status_code}')
+                return result
+            
+            data = r.json()
+            result['company'] = data.get('entityName', '')
+            
+            facts = data.get('facts', {})
+            us_gaap = facts.get('us-gaap', {})
+            
+            print(f"[OK] {result['company']} (CIK: {cik})")
+            print(f"  可用科目: {len(us_gaap)} 个")
+            
+            # 提取关键财务科目
+            for key, item_name in KEY_ITEMS.items():
+                if item_name in us_gaap:
+                    item_data = us_gaap[item_name]
+                    units = item_data.get('units', {})
+                    
+                    # 优先取USD单位
+                    usd_data = units.get('USD', [])
+                    shares_data = units.get('shares', [])
+                    per_share_data = units.get('USD/shares', [])
+                    
+                    data_list = usd_data or shares_data or per_share_data
+                    
+                    if data_list:
+                        # 按日期排序，取最近5期
+                        data_list = sorted(data_list, key=lambda x: x.get('end', ''), reverse=True)[:5]
+                        
+                        values = []
+                        for d in data_list:
+                            values.append({
+                                'date': d.get('end', ''),
+                                'value': d.get('val', 0),
+                                'frame': d.get('frame', '')
+                            })
+                        
+                        result['financials'][key] = values
+                        
+                        # 打印最新值
+                        latest = values[0]
+                        val = latest['value']
+                        if key in ['eps_basic']:
+                            print(f"  {key}: ${val:.2f} ({latest['date'][:10]})")
+                        else:
+                            unit = '亿' if abs(val) > 1e9 else '万'
+                            scale = 1e8 if abs(val) > 1e9 else 1e4
+                            print(f"  {key}: {val/scale:.2f}{unit} ({latest['date'][:10]})")
+                else:
+                    result['warnings'].append(f'未找到科目: {key}')
+            
+            if result['financials']:
+                result['success'] = True
+            
+        except Exception as e:
+            result['warnings'].append(f'请求失败: {e}')
+        
+        return result
+    
+    def calculate_ratios(self, financials: Dict) -> Dict:
+        """计算财务比率"""
+        ratios = {}
+        
+        # 获取最新值
+        def get_latest(key):
+            data = financials.get(key, [])
+            return data[0]['value'] if data else 0
+        
+        revenue = get_latest('revenue')
+        net_income = get_latest('net_income')
+        assets = get_latest('total_assets')
+        equity = get_latest('total_equity')
+        gross_profit = get_latest('gross_profit')
+        
+        # 计算比率
+        if revenue > 0:
+            ratios['gross_margin'] = gross_profit / revenue * 100
+            ratios['net_margin'] = net_income / revenue * 100
+        
+        if equity > 0:
+            ratios['roe'] = net_income / equity * 100
+            ratios['roa'] = net_income / assets * 100 if assets > 0 else 0
+        
+        if assets > 0:
+            ratios['asset_turnover'] = revenue / assets
+        
+        return ratios
+
+
+# ============================================
+# 便捷函数
+# ============================================
+def fetch_us_financials(ticker: str) -> Dict:
+    """获取美股财务数据"""
+    api = SECXBRLAPI()
+    return api.get_company_facts(ticker)
+
+
+# ============================================
+# 测试
+# ============================================
+if __name__ == '__main__':
+    import sys
+    
+    print("=" * 60)
+    print("SEC XBRL API测试")
+    print("=" * 60)
+    
+    test_tickers = ['AAPL', 'MSFT', 'BABA']
+    
+    for ticker in test_tickers:
+        print(f"\n{ticker}:")
+        result = fetch_us_financials(ticker)
+        
+        if result['success']:
+            print(f"✅ 成功获取 {len(result['financials'])} 个财务科目")
+            
+            # 计算比率
+            api = SECXBRLAPI()
+            ratios = api.calculate_ratios(result['financials'])
+            if ratios:
+                print(f"\n财务比率:")
+                for k, v in ratios.items():
+                    print(f"  {k}: {v:.2f}%")
+        else:
+            print(f"❌ 失败: {result.get('warnings', [])}")
+    
+    print("\n" + "=" * 60)
+    print("测试完成")
+    print("=" * 60)

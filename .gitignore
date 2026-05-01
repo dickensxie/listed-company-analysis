@@ -1,0 +1,9 @@
+# Secrets
+.tushare_token
+
+# Output
+output/
+
+# Cache
+__pycache__/
+*.pyc

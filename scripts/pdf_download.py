@@ -1,0 +1,606 @@
+# -*- coding: utf-8 -*-
+"""
+pdf_download.py - PDF 下载与提取模块
+支持 CNINFO 年报PDF下载（沪深） + BSE年报PDF下载（北交所）
++ 上交所年报PDF下载（cookie反爬流程） + PyMuPDF 文本提取
+"""
+import os
+import re
+import json
+import requests
+from typing import Dict, List, Optional, Tuple
+from datetime import datetime
+
+
+# ================================================================
+# 上交所（沪市）年报PDF下载 - JS反爬cookie流程
+# 适用：6开头股票（沪市），深交所和北交所不受此保护
+# 依赖：xbrowser（获取cookie）+ requests（带cookie下载）
+# ================================================================
+
+def _build_sse_annual_url(stock_code: str, year: int = None) -> str:
+    """
+    构建上交所年报PDF直链（无需JS渲染，直接构造URL）
+    格式：https://static.sse.com.cn/disclosure/listedinfo/announcement/c/new/{YYYY-MM-DD}/{code}_{YYYYMMDD}_{id}.pdf
+    """
+    # 上交所公告按股票代码目录存放，文件名格式相对固定
+    # 实际URL需从公告列表API获取，这里返回搜索页URL供xbrowser使用
+    return f"https://www.sse.com.cn/disclosure/listedinfo/listing/"
+
+
+def get_sse_annual_report_list(stock_code: str, years: int = 3) -> List[Dict]:
+    """
+    从上交所官网API获取年报列表（无需JS，直接请求）
+    API: https://query.sse.com.cn/sseQuery/commonQuery.do
+    """
+    session = requests.Session()
+    session.headers.update({
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Referer': 'https://www.sse.com.cn/',
+        'Accept': 'application/json, text/plain, */*',
+    })
+    
+    api_url = 'https://query.sse.com.cn/sseQuery/commonQuery.do'
+    params = {
+        'jsonCallBack': '',
+        'isPagination': 'false',
+        'pageHelp.pageSize': '30',
+        'pageHelp.pageNo': '1',
+        'sqlId': 'COMMON_SSE_ZQPZ_GPLB_MCJS_SSGS_L',
+        'COMPANY_CODE': stock_code,
+        'report_type': '2',  # 年报
+        'START_DATE': '',
+        'END_DATE': '',
+    }
+    
+    try:
+        r = session.get(api_url, params=params, timeout=15)
+        text = r.text
+        # 去掉JSONP包装
+        if text.startswith('('):
+            text = text[1:]
+        if text.endswith(')'):
+            text = text[:-1]
+        j = json.loads(text)
+        result_list = j.get('result', []) or []
+        
+        reports = []
+        for item in result_list:
+            title = item.get('TITLE', '')
+            if '年度报告' in title and '摘要' not in title:
+                pub_date = item.get('PUBLISH_DATE', '')
+                adj_url = item.get('ATTACHMENT_URL', '')
+                if adj_url:
+                    # 上交所PDF路径格式
+                    if not adj_url.startswith('http'):
+                        adj_url = 'https://static.sse.com.cn/' + adj_url.lstrip('/')
+                    year_match = re.search(r'(\d{4})', pub_date)
+                    yr = int(year_match.group(1)) if year_match else None
+                    reports.append({
+                        'year': yr,
+                        'title': title,
+                        'pdf_url': adj_url,
+                        'date': pub_date[:10] if pub_date else '',
+                    })
+        
+        reports.sort(key=lambda x: x['year'] or 0, reverse=True)
+        return reports[:years]
+    
+    except Exception as e:
+        print(f"[WARN] get_sse_annual_report_list: {e}")
+        return []
+
+
+def download_sse_pdf_with_cookie(pdf_url: str, save_path: str, cookie_value: str = None, timeout: int = 120) -> bool:
+    """
+    带cookie下载上交所年报PDF
+    
+    Args:
+        pdf_url: 上交所PDF直链
+        save_path: 保存路径
+        cookie_value: acw_sc__v2=xxx cookie值（从xbrowser提取）
+        timeout: 超时秒数
+    
+    Returns:
+        是否成功
+    """
+    # 如果cookie_value为空，尝试不带cookie下载（有些PDF无反爬）
+    cookies = {'acw_sc__v2': cookie_value} if cookie_value else {}
+    
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Accept': 'application/pdf,*/*',
+        'Referer': 'https://www.sse.com.cn/',
+    }
+    
+    try:
+        r = requests.get(pdf_url, headers=headers, cookies=cookies, timeout=timeout)
+        if r.status_code == 200 and len(r.content) > 10000:
+            # 检查是否返回了混淆JS而非PDF
+            if r.content[:4] != b'%PDF':
+                print(f"[FAIL] 返回内容不是PDF（可能是JS反爬），需要xbrowser提取cookie")
+                return False
+            with open(save_path, 'wb') as f:
+                f.write(r.content)
+            print(f"[OK] 上交所PDF下载成功: {save_path} ({len(r.content)/1024/1024:.1f}MB)")
+            return True
+        else:
+            print(f"[FAIL] 上交所PDF下载失败: status={r.status_code}, size={len(r.content)}")
+            return False
+    except Exception as e:
+        print(f"[ERROR] download_sse_pdf_with_cookie: {e}")
+        return False
+
+
+# ================================================================
+# 上交所年报PDF自动化流程（需配合xbrowser）
+# 使用方法：
+#   1. xbrowser打开PDF页面：xb open https://static.sse.com.cn/xxx.pdf
+#   2. 提取cookie：xb act kind=evaluate fn:"() => document.cookie"
+#   3. 运行此函数：python scripts/pdf_download.py --sse-download --url "..." --cookie "xxx" --out "..."
+# ================================================================
+def sse_pdf_workflow(pdf_url: str, cookie_value: str, save_path: str) -> Dict:
+    """
+    上交所年报PDF一键下载流程
+    
+    推荐使用xbrowser自动获取cookie：
+        1. xb open {pdf_url}
+        2. xb act kind=evaluate fn:"() => document.cookie"
+        3. 使用返回值中的 acw_sc__v2=xxx 传入此函数
+    
+    Args:
+        pdf_url: 上交所PDF完整URL
+        cookie_value: acw_sc__v2=xxx
+        save_path: 保存路径
+    
+    Returns:
+        {'success': bool, 'pdf_path': str, 'page_count': int, 'error': str}
+    """
+    os.makedirs(os.path.dirname(save_path) or '.', exist_ok=True)
+    ok = download_sse_pdf_with_cookie(pdf_url, save_path, cookie_value)
+    if not ok:
+        return {'success': False, 'pdf_path': save_path, 'error': 'PDF下载失败（可能需cookie）'}
+    
+    try:
+        import fitz
+        doc = fitz.open(save_path)
+        page_count = doc.page_count
+        doc.close()
+        return {'success': True, 'pdf_path': save_path, 'page_count': page_count}
+    except Exception as e:
+        return {'success': True, 'pdf_path': save_path, 'error': f'页数提取失败: {e}'}
+import os
+import re
+import json
+import requests
+from typing import Dict, List, Optional, Tuple
+from datetime import datetime
+
+
+# ============================================================
+# BSE（北交所）年报下载
+# ============================================================
+
+def _is_bse_stock(stock_code: str) -> bool:
+    """判断是否为北交所股票"""
+    return stock_code.startswith('8') or stock_code.startswith('9')
+
+
+def _get_bse_annual_reports(stock_code: str, years: int = 3) -> List[Dict]:
+    """
+    从北交所(BSE)官网获取年报列表
+    API: POST https://www.bse.cn/disclosureInfoController/initDisclosureList.do
+    
+    注意: companyCd参数无效，需遍历分页查找目标公司
+    需翻页50-100页才能覆盖全部公告
+    
+    Returns:
+        [{'year': int, 'title': str, 'pdf_url': str, 'date': str}, ...]
+    """
+    session = requests.Session()
+    session.headers.update({
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        'Referer': 'https://www.bse.cn/disclosure/announcement.html',
+        'Accept': '*/*',
+        'Accept-Language': 'zh-CN,zh;q=0.9',
+    })
+    # 获取session cookie
+    try:
+        session.get('https://www.bse.cn/disclosure/announcement.html', timeout=10)
+    except:
+        pass
+
+    api_url = 'https://www.bse.cn/disclosureInfoController/initDisclosureList.do'
+    all_anns = []
+
+    for page in range(1, 100):
+        params = [
+            ('page', str(page)), ('companyCd', ''), ('xxfcbj[]', '2'),
+            ('siteId', '6'), ('flag', '0'), ('isNewThree', '1'),
+            ('disclosureSubtype[]', ''), ('keyword', ''),
+        ]
+        try:
+            r = session.post(api_url, data=params, timeout=10)
+            j = r.json()
+            content = j.get('data', {}).get('content', [])
+            if not content:
+                break
+            for item in content:
+                for d in item.get('disclosures', []):
+                    cd = d.get('companyCd', '')
+                    if cd == stock_code:
+                        all_anns.append(d)
+        except Exception:
+            break
+        # 翻够50页还没找到目标公司，放弃
+        if page > 50 and not all_anns:
+            break
+
+    reports = []
+    for ann in all_anns:
+        title = ann.get('disclosureTitle', '')
+        # 严格判断：年报全文（排除摘要、业绩说明会预告等）
+        if ('年度报告' in title and '摘要' not in title
+                and '业绩说明' not in title and '说明会' not in title):
+            path = ann.get('destFilePath', '')
+            if path:
+                year_match = re.search(r'(\d{4})', path)
+                year = int(year_match.group(1)) if year_match else None
+                reports.append({
+                    'year': year,
+                    'title': title,
+                    'pdf_url': f'https://www.bse.cn{path}',
+                    'date': path[:10] if path else '',
+                })
+
+    reports.sort(key=lambda x: x.get('year') or 0, reverse=True)
+    return reports[:years]
+
+
+# ============================================================
+# CNINFO（沪深）年报下载
+# ============================================================
+
+def get_annual_report_list(stock_code: str, company_name: str = None, years: int = 3) -> List[Dict]:
+    """
+    从 CNINFO 获取年报列表
+
+    Args:
+        stock_code: 股票代码
+        company_name: 公司名称（推荐，搜索更稳定）
+        years: 获取最近几年
+
+    Returns:
+        年报列表 [{'year': int, 'title': str, 'pdf_url': str, 'date': str}, ...]
+    """
+    url = 'https://www.cninfo.com.cn/new/hisAnnouncement/query'
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
+        'Referer': 'http://www.cninfo.com.cn/new/disclosure/stock',
+        'Origin': 'http://www.cninfo.com.cn',
+        'X-Requested-With': 'XMLHttpRequest',
+        'Content-Type': 'application/x-www-form-urlencoded',
+    }
+
+    searchkey = company_name if company_name else stock_code
+
+    data = {
+        'tabName': 'fulltext',
+        'category': 'category_ndbg_szsh',
+        'plate': 'sz',
+        'searchkey': searchkey,
+        'seDate': '',
+        'isHLtitle': 'true',
+        'pageSize': 30,
+    }
+
+    if stock_code.startswith('6'):
+        data['plate'] = 'sh'
+    elif stock_code.startswith('0') or stock_code.startswith('3'):
+        data['plate'] = 'sz'
+
+    try:
+        r = requests.post(url, data=data, headers=headers, timeout=15)
+        result = r.json()
+        announcements = result.get('announcements') or []
+
+        reports = []
+        for ann in announcements:
+            title = ann.get('announcementTitle', '')
+            if '年度报告' in title and '摘要' not in title:
+                adj_url = ann.get('adjunctUrl', '')
+                if adj_url:
+                    year_match = re.search(r'(\d{4})年', title)
+                    year = int(year_match.group(1)) if year_match else None
+                    reports.append({
+                        'year': year,
+                        'title': title,
+                        'pdf_url': f"http://static.cninfo.com.cn/{adj_url}",
+                        'date': ann.get('announcementTime', ''),
+                        'announcement_id': ann.get('announcementId', ''),
+                    })
+
+        reports.sort(key=lambda x: x['year'] or 0, reverse=True)
+        return reports[:years]
+
+    except Exception as e:
+        print(f"[ERROR] get_annual_report_list: {e}")
+        return []
+
+
+# ============================================================
+# PDF下载核心
+# ============================================================
+
+def download_pdf(pdf_url: str, save_path: str, timeout: int = 120) -> bool:
+    """
+    下载 PDF 文件
+
+    Args:
+        pdf_url: PDF URL
+        save_path: 保存路径
+        timeout: 超时秒数
+
+    Returns:
+        是否成功
+    """
+    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
+
+    try:
+        r = requests.get(pdf_url, headers=headers, timeout=timeout)
+        if r.status_code == 200 and len(r.content) > 10000:
+            with open(save_path, 'wb') as f:
+                f.write(r.content)
+            print(f"[OK] PDF下载成功: {save_path} ({len(r.content)/1024/1024:.1f}MB)")
+            return True
+        else:
+            print(f"[FAIL] PDF下载失败: status={r.status_code}, size={len(r.content)}")
+            return False
+    except Exception as e:
+        print(f"[ERROR] download_pdf: {e}")
+        return False
+
+
+# ============================================================
+# PDF文本提取（PyMuPDF + pdfplumber双引擎）
+# ============================================================
+
+def extract_pdf_text(pdf_path: str, pages: int = None, toc_only: bool = False) -> Dict:
+    """
+    提取 PDF 文本内容
+
+    Args:
+        pdf_path: PDF 文件路径
+        pages: 提取页数 (None = 全部)
+        toc_only: 只提取目录
+
+    Returns:
+        {
+            'page_count': int,
+            'toc': [...],  # 目录
+            'text': str,   # 文本内容
+            'sections': {...}  # 按章节提取的内容
+        }
+    """
+    import fitz  # PyMuPDF
+
+    doc = fitz.open(pdf_path)
+    total_pages = doc.page_count
+
+    result = {
+        'page_count': total_pages,
+        'toc': [],
+        'text': '',
+        'sections': {},
+    }
+
+    # 提取目录
+    toc = doc.get_toc()
+    if toc:
+        result['toc'] = [
+            {'level': level, 'title': title, 'page': page}
+            for level, title, page in toc
+        ]
+
+    if toc_only:
+        doc.close()
+        return result
+
+    # 提取文本
+    extract_pages = pages if pages else total_pages
+    text_parts = []
+
+    for page_num in range(min(extract_pages, total_pages)):
+        page = doc[page_num]
+        text = page.get_text()
+        text_parts.append(f"--- 第{page_num+1}页 ---\n{text}")
+
+    result['text'] = '\n'.join(text_parts)
+    doc.close()
+
+    return result
+
+
+def extract_key_sections(pdf_path: str) -> Dict:
+    """
+    提取年报关键章节
+
+    Args:
+        pdf_path: PDF 文件路径
+
+    Returns:
+        {
+            'management_discussion': str,  # 管理层讨论与分析
+            'risk_factors': str,           # 风险因素
+            'financial_highlights': str,   # 财务数据摘要
+            'shareholders': str,           # 股东情况
+            'important_matters': str,       # 重要事项
+        }
+    """
+    import fitz
+
+    doc = fitz.open(pdf_path)
+    toc = doc.get_toc()
+
+    # 构建章节->页码映射
+    section_pages = {}
+    for level, title, page in toc:
+        if level <= 2:
+            section_pages[title] = page
+
+    # 定义要提取的章节
+    section_keywords = {
+        'management_discussion': ['管理层讨论', '经营情况讨论'],
+        'risk_factors': ['风险', '可能面对'],
+        'financial_highlights': ['主要会计数据', '财务指标'],
+        'shareholders': ['股份变动', '股东情况'],
+        'important_matters': ['重要事项'],
+    }
+
+    result = {}
+
+    for key, keywords in section_keywords.items():
+        start_page = None
+        end_page = None
+
+        for title, page in section_pages.items():
+            if any(kw in title for kw in keywords):
+                start_page = page
+                break
+
+        if start_page:
+            found_current = False
+            for level, title, page in toc:
+                if page == start_page:
+                    found_current = True
+                    continue
+                if found_current and level <= 2:
+                    end_page = page - 1
+                    break
+
+            if not end_page:
+                end_page = min(start_page + 30, doc.page_count)
+
+            text_parts = []
+            for p in range(start_page - 1, min(end_page, doc.page_count)):
+                page = doc[p]
+                text_parts.append(page.get_text())
+
+            result[key] = '\n'.join(text_parts)
+
+    doc.close()
+    return result
+
+
+# ============================================================
+# 一键下载并提取
+# ============================================================
+
+def download_and_extract(stock_code: str, company_name: str = None,
+                         save_dir: str = None, year: int = None) -> Dict:
+    """
+    一键下载并提取年报（自动识别市场）
+    
+    市场判断规则：
+    - 北交所：8xxxx / 92xxx
+    - 上交所（沪市）：6xxxx → 使用上交所API（JS反爬cookie流程）
+    - 深交所（深市）：0xxxx / 3xxxx
+    - 港股：4-5位数字
+    """
+    # 判断市场并获取年报列表
+    _years_default = 3  # 默认取近3年用于列表查找
+    
+    if _is_bse_stock(stock_code):
+        reports = _get_bse_annual_reports(stock_code, years=_years_default)
+    elif stock_code.startswith('6'):
+        # 上交所：6xxxx
+        print(f"[INFO] 检测到上交所股票 {stock_code}，使用上交所API...")
+        reports = get_sse_annual_report_list(stock_code, years=_years_default)
+        if not reports:
+            print(f"[WARN] 上交所API无结果，降级到CNINFO...")
+            reports = get_annual_report_list(stock_code, company_name, years=_years_default)
+    else:
+        reports = get_annual_report_list(stock_code, company_name, years=_years_default)
+
+    if not reports:
+        return {'error': f'未找到年报 (stock_code={stock_code})'}
+
+    # 选择年份
+    target_report = None
+    if year:
+        for r in reports:
+            if r['year'] == year:
+                target_report = r
+                break
+    else:
+        target_report = reports[0]
+
+    if not target_report:
+        return {'error': f'未找到 {year} 年年报'}
+
+    # 确定保存路径
+    if not save_dir:
+        save_dir = os.path.join(os.getcwd(), 'output', f'{stock_code}_{datetime.now().strftime("%Y%m%d")}', 'data')
+
+    os.makedirs(save_dir, exist_ok=True)
+    pdf_path = os.path.join(save_dir, f'{target_report["year"]}_annual_report.pdf')
+
+    # 下载（跳过已存在的）
+    is_sse = stock_code.startswith('6')
+    pdf_url = target_report['pdf_url']
+    
+    if not os.path.exists(pdf_path):
+        if is_sse:
+            # 上交所PDF：尝试无cookie下载，失败后提示需要xbrowser cookie
+            ok = download_pdf(pdf_url, pdf_path)
+            if not ok or os.path.getsize(pdf_path) < 10000:
+                # 检查是否返回了JS而非PDF
+                with open(pdf_path, 'rb') as f:
+                    magic = f.read(4)
+                if magic != b'%PDF':
+                    print(f"[WARN] 上交所PDF疑似JS反爬（magic={magic}），请使用xbrowser获取cookie后重试")
+                    print(f"[WARN] 提示：在xbrowser中打开 {pdf_url} 后执行:")
+                    print(f"[WARN]   xb act kind=evaluate fn:\")() => document.cookie\"")
+                    print(f"[WARN] 获取cookie后使用: sse_pdf_workflow(url, cookie, save_path)")
+                    return {'error': f'上交所PDF反爬，需xbrowser cookie流程（magic={magic}）'}
+        else:
+            if not download_pdf(pdf_url, pdf_path):
+                return {'error': 'PDF下载失败'}
+    else:
+        print(f"[SKIP] PDF已存在: {pdf_path}")
+
+    # ── 步骤2：提取PDF文本和目录 ─────────────────────────────────────────────
+    extracted = extract_pdf_text(pdf_path)
+    
+    # ── 步骤3：调用 annual_extract.py 提取20个关键章节 ─────────────────────
+    sections = {}
+    text_preview = extracted['text'][:5000]
+    if os.path.exists(pdf_path) and os.path.getsize(pdf_path) > 100000:
+        try:
+            from scripts.annual_extract import AnnualReportExtractor
+            extractor = AnnualReportExtractor(pdf_path=pdf_path)
+            if extractor.text:
+                sections = extractor.extract_all()
+                text_preview = extractor.text[:5000]
+                print(f"  📑 提取 {len(sections)} 个章节（{'中文' if extractor.lang=='cn' else '英文'}年报）")
+            else:
+                print(f"  ⚠️ 年报文本为空（乱码或提取失败）")
+        except Exception as e:
+            print(f"  ⚠️ annual_extract 调用失败: {e}")
+
+    return {
+        'pdf_path': pdf_path,
+        'year': target_report['year'],
+        'title': target_report['title'],
+        'page_count': extracted['page_count'],
+        'toc': extracted['toc'][:50],
+        'sections': sections,
+        'text_preview': text_preview,
+    }
+
+
+# 使用示例
+if __name__ == '__main__':
+    # 北交所测试
+    result = download_and_extract('920262')
+    print(json.dumps(result, ensure_ascii=False, indent=2, default=str))
