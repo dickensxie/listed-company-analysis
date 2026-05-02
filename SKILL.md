@@ -155,6 +155,150 @@ unlock = ts.get_share_float('000001.SZ', days=365)
 
 ---
 
+## THSDK 数据源（同花顺SDK v2 — 实时行情+自然语言选股+美股）
+
+**文件**：`scripts/thsdk_search.py` **v2**
+
+**用途**：实时行情（A股30+字段/港股/美股）、K线（含分钟级）、板块数据、自然语言选股、DDE大单流向、五档盘口、分红历史、竞价异动、资讯快讯
+
+**安装**：`pip install --upgrade thsdk`（当前v1.7.18，游客账号免费可用）
+
+### CLI 使用
+
+```bash
+# 自然语言选股（核心新能力）
+python scripts/thsdk_search.py nlp "连续3天涨停"
+python scripts/thsdk_search.py nlp "PE<20且市值>100亿的半导体股"
+python scripts/thsdk_search.py nlp "人工智能概念股" --max 30
+
+# 证券模糊搜索（A股/港股/美股通用）
+python scripts/thsdk_search.py search "茅台"
+python scripts/thsdk_search.py search "AAPL"
+
+# A股实时行情（30+字段：PE TTM/主力净流入/委比/量比/涨停跌停价/流通市值等）
+python scripts/thsdk_search.py quote 600519
+
+# 港股实时行情（基础数据+财务指标）
+python scripts/thsdk_search.py quote_hk 00700
+
+# 美股实时行情（基础数据+财务指标+52周高低点）
+python scripts/thsdk_search.py quote_us AAPL
+python scripts/thsdk_search.py quote_us TSLA
+
+# K线数据（支持分钟级）
+python scripts/thsdk_search.py kline 300033 --interval day --count 30
+python scripts/thsdk_search.py kline 300033 --interval 5m --count 20
+python scripts/thsdk_search.py kline 300033 --interval week --count 20 --adjust qfq
+
+# 板块数据
+python scripts/thsdk_search.py block --type industry          # 行业板块列表
+python scripts/thsdk_search.py block --type concept --name AI  # 概念板块筛选
+python scripts/thsdk_search.py constituents 886099              # AI智能体成分股
+
+# 分红送转
+python scripts/thsdk_search.py dividend 300033
+
+# DDE大单流向（逐笔成交+买卖方向）
+python scripts/thsdk_search.py dde 300033 --max 50
+
+# 五档盘口
+python scripts/thsdk_search.py depth 300033
+
+# 分时数据
+python scripts/thsdk_search.py intraday 300033
+
+# 集合竞价
+python scripts/thsdk_search.py call_auction 300033
+
+# 竞价异动（涨停试盘/跌停试盘）
+python scripts/thsdk_search.py auction USZA
+
+# IPO排队
+python scripts/thsdk_search.py ipo
+
+# 7x24资讯
+python scripts/thsdk_search.py news --max 20
+```
+
+### Python 调用
+
+```python
+from thsdk_search import ThsdkSearch
+
+with ThsdkSearch() as ts:
+    # A股实时行情（30+字段）
+    q = ts.quote("600519")
+    print(q['data']['价格'], q['data']['市盈率TTM'], q['data']['主力净流入'])
+    
+    # 港股实时行情
+    hk = ts.quote_hk("00700")
+    print(hk['data']['价格'], hk['data']['市盈率TTM'])
+    
+    # 美股实时行情
+    us = ts.quote_us("AAPL")
+    print(us['data']['价格'], us['data']['52周最高'], us['data']['52周最低'])
+    
+    # 自然语言选股
+    r = ts.nlp("PE<20且市值>100亿的半导体股")
+    print(r['total'], r['data'][:5])
+    
+    # DDE大单流向
+    dde = ts.dde("300033")
+    
+    # 五档盘口
+    depth = ts.depth("300033")
+    print(depth['bids'], depth['asks'])
+```
+
+### THS代码规则
+
+| 市场 | 前缀 | 示例 | 说明 |
+|------|------|------|------|
+| 沪A | USHA | USHA600519 | 4位市场+6位数字 |
+| 深A | USZA | USZA300033 | 4位市场+6位数字 |
+| 北交 | USZA | USZA920262 | 4位市场+6位数字 |
+| 港股 | UHKMHK | UHKMHK0700 | **4位数字**（不是5位！）|
+| 美股(纳斯达克) | UNQQ | UNQQAAPL | 4位市场+字母symbol |
+| 美股(纽交所) | UNYN | UNYNJPM | 4位市场+字母symbol |
+| 行业板块 | URFI | URFI881165 | 4位市场+6位数字 |
+| 概念板块 | URFI | URFI885779 | 4位市场+6位数字 |
+
+> `code_to_ths()` 自动转换6位代码→THS代码，`quote_us()` 自动搜索获取正确的THS代码，无需手动拼
+
+### 数据源分工
+
+| 数据需求 | 首选 | 备选 |
+|----------|------|------|
+| A股实时行情(30+字段) | **THSDK** | 东方财富API |
+| 港股实时行情 | **THSDK** | AKShare |
+| 美股实时行情 | **THSDK** | Yahoo Finance |
+| K线数据(含分钟级) | **THSDK** | AKShare |
+| 自然语言选股 | **THSDK** | 无 |
+| 板块/概念列表 | **THSDK** | AKShare |
+| DDE大单流向 | **THSDK** | 无 |
+| 五档盘口 | **THSDK** | 无 |
+| 分时数据 | **THSDK** | 无 |
+| 集合竞价 | **THSDK** | 无 |
+| 分红送转 | **THSDK** | Tushare |
+| 竞价异动 | **THSDK** | 无 |
+| IPO排队 | **THSDK** | 无 |
+| 资讯快讯 | **THSDK** | 无 |
+| 财务报表 | 东方财富API | AKShare |
+| 公告/年报PDF | 巨潮资讯 | 上交所 |
+| 解禁时间表 | Tushare | 东方财富 |
+| 估值指标 | 东方财富API | Tushare |
+| 美股深度(盘前盘后/期权/资金流) | Futu API | — |
+
+### 限制
+- 游客账号：稳定但可能限频（20ms/次）
+- `market_data_cn('行情数据'/'财务数据')` 游客权限不可用
+- 美股K线不可用（THS代码格式不兼容：UNQQAAPL不符合"4位市场+6位数字"规则）
+- 美股买1/卖1价量在游客模式下返回int32最大值（无效）
+- 美股depth/call_auction超时不可用
+- 正式账号配置：`THS({'username': '...', 'password': '...', 'mac': '...'})`
+
+---
+
 ## 输出文件
 
 ```
@@ -180,6 +324,7 @@ output/{股票代码}_{日期}/
 
 - Python 3.8+
 - requests, pdfplumber, pandas, akshare, matplotlib（可选）
+- **thsdk**：pip install thsdk（实时行情/K线/自然语言选股/板块数据）
 - **tushare**：pip install tushare（分红/解禁数据补充）
 - 网络：能访问东方财富、巨潮资讯、证监会官网、Yahoo Finance（港股/美股估值）
 
@@ -414,6 +559,10 @@ python analyze.py --stock 002180 --dims multi_year_trend,valuation,earnings_fore
 
 # 港股深度分析
 python analyze.py --stock 06939 --market hk --full
+
+# THSDK 自然语言选股
+python scripts/thsdk_search.py nlp "人工智能概念股"
+python scripts/thsdk_search.py quote 600519
 
 # 专利情报追踪
 python scripts/patent_tracker.py --company "小米集团" --stock 01810.HK --market hk
