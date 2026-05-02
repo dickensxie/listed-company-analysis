@@ -10,12 +10,34 @@ from scripts.safe_request import safe_get, safe_extract, safe_float
 
 EM_API = "http://datacenter-web.eastmoney.com/api/data/v1/get"
 EM_QUOTE = "http://push2.eastmoney.com/api/qt/stock/get"
+EM_VALUATION = "http://datacenter-web.eastmoney.com/api/data/v1/get"  # RPT_VALUEANALYSIS_DET
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
     "Referer": "http://data.eastmoney.com/",
     "Accept": "application/json",
 }
-QUOTE_FIELDS = "f43,f44,f45,f46,f47,f48,f50,f57,f58,f116,f162,f167,f168,f169,f170,f171,f292"
+QUOTE_FIELDS = "f43,f44,f45,f46,f47,f48,f50,f57,f58,f116,f117,f162,f167,f168,f169,f170,f171,f292"
+
+
+def _fetch_valuation_data(secucode):
+    """从datacenter获取最新估值数据（PE/PB/PS）— 主数据源"""
+    # 已验证可用列: SECUCODE, TRADE_DATE, SECURITY_NAME_ABBR, CLOSE_PRICE, PE_TTM, PB_MRQ, PS_TTM
+    # 注意: PE_DYNAMIC, CIRCULATING_MARKET_CAP 等列不存在
+    params = {
+        "reportName": "RPT_VALUEANALYSIS_DET",
+        "columns": "SECUCODE,TRADE_DATE,SECURITY_NAME_ABBR,CLOSE_PRICE,PE_TTM,PB_MRQ,PS_TTM",
+        "filter": f'(SECUCODE="{secucode}")',
+        "pageSize": 1,
+        "sortColumns": "TRADE_DATE",
+        "sortTypes": -1,
+        "source": "WEB",
+        "client": "WEB",
+    }
+    raw = safe_get(EM_VALUATION, params=params, headers=HEADERS, timeout=20)
+    records = safe_extract(raw, ["result", "data"], default=[])
+    if records and len(records) > 0:
+        return records[0]
+    return None
 
 
 def _market_id(stock_code):
@@ -125,31 +147,43 @@ def fetch_valuation(stock_code, market="a", data_dir=None, records=None):
             result["warnings"].append(f"估值获取异常: {str(e)[:30]}")
         return result
 
-    # A股：使用东方财富API
+    # A股：优先使用 datacenter 估值API（RPT_VALUEANALYSIS_DET），降级行情API
     secucode = _secucode(stock_code)
     plain = stock_code.replace(".SZ", "").replace(".SH", "").replace(".BJ", "")
     mid = _market_id(plain)
 
-    # 1. 当前行情
-    params_q = {"secid": f"{mid}.{plain}", "fields": QUOTE_FIELDS, "ut": "fa1fd612f2f5e7b0"}
-    raw_q = safe_get(EM_QUOTE, params=params_q, headers=HEADERS, timeout=15)
-    qdata = safe_extract(raw_q, ["data"], {})
-
-    if qdata:
-        def fval(key, divisor=1):
-            v = qdata.get(key)
-            return round(float(v) / divisor, 2) if v and str(v) not in ["-", ""] else None
-
+    # 1. 当前估值 — 优先用 datacenter 估值API
+    val_data = _fetch_valuation_data(secucode)
+    if val_data:
         result["current"] = {
-            "price": fval("f43", 1000),
-            "market_cap_亿": round(fval("f57", 1) / 1e8, 2) if fval("f57") else None,
-            "float_market_cap_亿": round(fval("f58", 1) / 1e8, 2) if fval("f58") else None,
-            "pe_ttm": fval("f169", 1000),
-            "pe_dyn": fval("f167", 1000),
-            "pb": fval("f168", 1000),
-            "ps": fval("f170", 1000),
-            "ps_ttm": fval("f171", 1000),
+            "price": val_data.get("CLOSE_PRICE"),
+            "company_name": val_data.get("SECURITY_NAME_ABBR", ""),
+            "pe_ttm": val_data.get("PE_TTM"),
+            "pb": val_data.get("PB_MRQ"),
+            "ps": val_data.get("PS_TTM"),
         }
+        result["valuation_source"] = "datacenter_RPT_VALUEANALYSIS_DET"
+    
+    # 补全市值（datacenter无市值字段，需从行情API获取）
+    if not result["current"].get("market_cap_亿"):
+        params_q = {"secid": f"{mid}.{plain}", "fields": "f43,f116,f117", "ut": "fa1fd612f2f5e7b0"}
+        raw_q = safe_get(EM_QUOTE, params=params_q, headers=HEADERS, timeout=15)
+        qdata = safe_extract(raw_q, ["data"], {})
+        if qdata:
+            def fval(key, divisor=1):
+                v = qdata.get(key)
+                if v is None or str(v) in ["-", ""]:
+                    return None
+                try:
+                    return round(float(v) / divisor, 2)
+                except (ValueError, TypeError):
+                    return None
+            result["current"].update({
+                "price": result["current"].get("price") or fval("f43", 1000),
+                "market_cap_亿": round(fval("f116", 1) / 1e8, 2) if fval("f116") else None,
+                "float_market_cap_亿": round(fval("f117", 1) / 1e8, 2) if fval("f117") else None,
+            })
+            result["valuation_source"] = result.get("valuation_source", "") + "+quote_api"
 
     # 2. 历史PE
     if records is None:

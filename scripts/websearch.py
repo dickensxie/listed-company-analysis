@@ -99,6 +99,61 @@ def search_cninfo_annual(stock_code: str, company_name: str = None) -> Dict:
     return params
 
 
+def search_cninfo_periodic(stock_code: str, company_name: str = None,
+                            report_type: str = 'semi_annual') -> Dict:
+    """
+    构造巨潮资讯半年报/季报搜索请求
+
+    Args:
+        stock_code: 股票代码
+        company_name: 公司名称
+        report_type: 'semi_annual' 或 'quarterly'
+
+    Returns:
+        构造好的请求参数
+    """
+    url = 'https://www.cninfo.com.cn/new/hisAnnouncement/query'
+
+    # 半年报/季报的分类码已失效，改用关键词搜索
+    suffix_map = {
+        'semi_annual': ' 半年度报告',
+        'quarterly': ' 季度报告',
+    }
+    searchkey = (company_name if company_name else stock_code) + suffix_map.get(report_type, '')
+
+    if stock_code.startswith('6'):
+        plate = 'sh'
+    elif stock_code.startswith('0') or stock_code.startswith('3'):
+        plate = 'sz'
+    elif stock_code.startswith('8') or stock_code.startswith('4'):
+        plate = 'bj'
+    else:
+        plate = 'sz'
+
+    params = {
+        'url': url,
+        'method': 'POST',
+        'headers': {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
+            'Referer': 'http://www.cninfo.com.cn/new/disclosure/stock',
+            'Origin': 'http://www.cninfo.com.cn',
+            'X-Requested-With': 'XMLHttpRequest',
+            'Content-Type': 'application/x-www-form-urlencoded',
+        },
+        'data': {
+            'tabName': 'fulltext',
+            'category': '',  # 不用分类码
+            'plate': plate,
+            'searchkey': searchkey,
+            'seDate': '',
+            'isHLtitle': 'true',
+            'pageSize': '30',
+        }
+    }
+
+    return params
+
+
 def parse_cninfo_response(json_data: dict) -> List[Dict]:
     """
     解析 CNINFO API 返回的年报列表
@@ -204,6 +259,18 @@ def build_search_plan(stock_code: str, company_name: str = None) -> List[Dict]:
             'name': '年报PDF',
             'description': '从巨潮资讯获取年报PDF链接',
             'search': search_cninfo_annual(stock_code, company_name),
+            'parser': 'parse_cninfo_response',
+        },
+        {
+            'name': '半年报PDF',
+            'description': '从巨潮资讯获取半年报PDF链接',
+            'search': search_cninfo_periodic(stock_code, company_name, report_type='semi_annual'),
+            'parser': 'parse_cninfo_response',
+        },
+        {
+            'name': '季报PDF',
+            'description': '从巨潮资讯获取季报PDF链接',
+            'search': search_cninfo_periodic(stock_code, company_name, report_type='quarterly'),
             'parser': 'parse_cninfo_response',
         },
         {

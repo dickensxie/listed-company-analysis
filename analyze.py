@@ -63,6 +63,11 @@ def parse_args():
     parser.add_argument('--output', default=None, help='输出目录')
     parser.add_argument('--no-pdf', action='store_true', help='跳过PDF下载')
     parser.add_argument('--no-peer', action='store_true', help='跳过同业对比')
+    parser.add_argument('--report-type', dest='report_type', default='all',
+                        choices=['annual', 'semi_annual', 'quarterly', 'all'],
+                        help='定期报告类型(all=年报+半年报+季报)')
+    parser.add_argument('--report-years', dest='report_years', type=int, default=1,
+                        help='定期报告回溯年数(默认1)')
     args = parser.parse_args()
     if not args.stock and not args.name and not args.company:
         parser.error('必须指定 --stock / --name 或 --company')
@@ -75,7 +80,8 @@ def parse_args():
 def call_dim(dim, stock, market, data_dir, results, args):
     """调用单个分析维度"""
     if dim == 'announcements':
-        return fetch_announcements(stock, market, data_dir)
+        return fetch_announcements(stock, market, data_dir,
+                                  deep_extract=True, max_critical=5, trace_events=True)
     elif dim == 'financial':
         # 美股走SEC EDGAR XBRL API（结构化数据，503科目）
         if market == 'us':
@@ -101,6 +107,8 @@ def call_dim(dim, stock, market, data_dir, results, args):
         return fetch_websearch(stock, data_dir)
     elif dim == 'annual_pdf':
         return fetch_annual_pdf(stock, data_dir, args)
+    elif dim == 'periodic_reports':
+        return fetch_periodic_reports(stock, data_dir, args)
     elif dim == 'hk_financial':
         return fetch_hk_financial(stock, market, data_dir)
     elif dim == 'peer_compare':
@@ -148,7 +156,15 @@ def call_dim(dim, stock, market, data_dir, results, args):
         # 港交所公告搜索（Playwright自动化）
         if market != 'hk':
             return {'status': 'skip', 'message': '仅支持港股市场'}
-        return search_hkex_announcements(stock, max_results=20)
+        hkex_result = search_hkex_announcements(stock, max_results=20)
+        # search_hkex_announcements 返回 list[dict]，需包装为 dict
+        if isinstance(hkex_result, list):
+            return {
+                'announcements': hkex_result,
+                'count': len(hkex_result),
+                'status': 'ok' if hkex_result else 'empty',
+            }
+        return hkex_result
     elif dim == 'bse_price':
         result = fetch_price(stock, 'bse', data_dir)
         if isinstance(result, list):
@@ -212,6 +228,8 @@ def _infer_source_from_dim(dim, result):
         return 'em_api'
     elif dim == 'valuation':
         return 'em_api'
+    elif dim == 'periodic_reports':
+        return 'cninfo_pdf'
     elif dim == 'hk_financial':
         return 'akshare_hk_fin'
 
@@ -223,7 +241,7 @@ def dim_label(dim):
         'announcements': '公告全景', 'financial': '财务报表', 'executives': '高管动态',
         'capital': '资金动作', 'subsidiary': '子公司IPO', 'related': '关联方运作',
         'regulatory': '监管历史', 'structure': '股权结构', 'industry': '行业竞争', 'risk': '综合风险',
-        'websearch': '联网搜索', 'annual_pdf': '年报PDF', 'hk_financial': '港股财务',
+        'websearch': '联网搜索', 'annual_pdf': '年报PDF', 'periodic_reports': '定期报告(年报+半年报+季报)', 'hk_financial': '港股财务',
         'peer_compare': '同业对比', 'rd_analysis': '研发与利润归因',
         'quote': '实时行情', 'bse_price': '实时行情',
         'multi_year_trend': '多年财务趋势', 'valuation': '估值分析',
@@ -244,7 +262,7 @@ def dim_summary(dim, result):
             return f"批量行情: {total}只 [{ok}只交易中]"
         return f"批量结果: {total}项"
     summaries = {
-        'announcements': f"获取 {result.get('count',0)} 条公告",
+        'announcements': f"公告{result.get('count',0)}条 | CRITICAL:{result.get('importance_stats',{}).get('critical',0)} MAJOR:{result.get('importance_stats',{}).get('major',0)} ROUTINE:{result.get('importance_stats',{}).get('routine',0)} | 溯源链:{len(result.get('event_chains',{}))}条"
         'financial': f"审计意见: {result.get('audit_opinion','未知')}",
         'executives': f"发现 {result.get('change_count',0)} 条高管变动",
         'capital': f"发现 {result.get('count',0)} 项资金动作",
@@ -255,6 +273,7 @@ def dim_summary(dim, result):
         'risk': f"风险等级: {result.get('level','未知')} | 得分: {result.get('score','?')}/100",
         'websearch': f"搜索完成",
         'annual_pdf': f"年报: {result.get('year','?')}年 | {result.get('page_count',0)}页" if result and not result.get('error') else "年报: 获取失败",
+        'periodic_reports': f"定期报告: 已下载{result.get('summary',{}).get('total_downloaded',0)}份" if result and not result.get('error') else "定期报告: 获取失败",
         'hk_financial': f"财务数据: {result.get('profile',{}).get('company_name_cn','?')} | 营收 {result.get('valuation',{}).get('revenue','?')}",
         'peer_compare': f"同业公司: {result.get('peer_count',0)}家 | 对比结论: {result.get('conclusion','N/A')}",
         'rd_analysis': f"主因: {result.get('profit_decomposition',{}).get('primary_cause','未知')} | 研发: {result.get('rd_quality',{}).get('rd_expense_亿','N/A')}亿元(资本化{result.get('rd_quality',{}).get('capitalization_rate','N/A')}%) | {result.get('rd_vs_loss_summary','N/A')}",
@@ -293,21 +312,40 @@ def run_peer_compare(stock, data_dir, args):
         return {'error': str(e), 'has_data': False}
 
 
+def _get_company_name(stock):
+    """获取公司名称 — 多数据源降级"""
+    # 数据源1: datacenter估值API（最可靠）
+    try:
+        prefix = 'SZ' if stock[:2] in ['00','30'] else 'SH'
+        secucode = f"{stock}.{prefix}"
+        from scripts.valuation import _fetch_valuation_data
+        val = _fetch_valuation_data(secucode)
+        if val and val.get('SECURITY_NAME_ABBR'):
+            return val['SECURITY_NAME_ABBR']
+    except:
+        pass
+    # 数据源2: 行情API（f58字段）
+    try:
+        import requests
+        mid = '0' if stock[:2] in ['00','30'] else '1'
+        url = "http://push2.eastmoney.com/api/qt/stock/get"
+        params = {'secid': f'{mid}.{stock}', 'fields': 'f58', 'ut': 'fa1fd612f2f5e7b0'}
+        headers = {'User-Agent': 'Mozilla/5.0', 'Referer': 'http://data.eastmoney.com/'}
+        r = requests.get(url, params=params, headers=headers, timeout=10)
+        data = r.json().get('data', {})
+        name = data.get('f58', '')
+        if name:
+            return name
+    except:
+        pass
+    return ''
+
+
 def fetch_websearch(stock, data_dir):
     """联网搜索维度（目前主要是年报PDF搜索）"""
     import json, requests
     
-    company_name = ''
-    # 从东方财富F10 API获取公司名（可能失败，不影响核心逻辑）
-    try:
-        prefix = 'sz' if stock[:2] in ['00','30'] else 'sh'
-        url = f"https://f10.eastmoney.com/CoreConpanyInfo/CoreConpanyInfoAjax"
-        params = {'code': f'{prefix}{stock}'}
-        r = requests.get(url, params=params, timeout=10)
-        data = r.json()
-        company_name = data.get('jbzl', {}).get('gsmc', '')
-    except:
-        pass
+    company_name = _get_company_name(stock)
     
     # 搜索年报PDF
     try:
@@ -327,17 +365,7 @@ def fetch_annual_pdf(stock, data_dir, args):
     """年报PDF下载与提取"""
     import json, requests
     
-    company_name = ''
-    # 从东方财富F10 API获取公司名
-    try:
-        prefix = 'sz' if stock[:2] in ['00','30'] else 'sh'
-        url = f"https://f10.eastmoney.com/CoreConpanyInfo/CoreConpanyInfoAjax"
-        params = {'code': f'{prefix}{stock}'}
-        r = requests.get(url, params=params, timeout=10)
-        data = r.json()
-        company_name = data.get('jbzl', {}).get('gsmc', '')
-    except:
-        pass
+    company_name = _get_company_name(stock)
     
     # 下载并提取年报
     try:
@@ -359,6 +387,39 @@ def fetch_annual_pdf(stock, data_dir, args):
             with open(sections_path, 'w', encoding='utf-8') as f:
                 json.dump(sections, f, ensure_ascii=False, indent=2)
     
+    return result
+
+
+def fetch_periodic_reports(stock, data_dir, args):
+    """定期报告（年报+半年报+季报）PDF下载与提取"""
+    import json
+    from scripts.pdf_download import download_and_extract_periodic, REPORT_CATEGORIES
+
+    company_name = _get_company_name(stock)
+    report_type = getattr(args, 'report_type', 'all') or 'all'
+    years = getattr(args, 'report_years', 1) or 1
+
+    try:
+        result = download_and_extract_periodic(
+            stock, company_name, save_dir=data_dir,
+            report_type=report_type, years=years
+        )
+    except Exception as e:
+        print(f"[ERROR] download_and_extract_periodic: {e}")
+        result = {'error': str(e)}
+
+    # 保存各报告的章节提取结果
+    if result and not result.get('error'):
+        reports = result.get('reports', {})
+        for rtype, year_data in reports.items():
+            if isinstance(year_data, dict) and 'status' not in year_data:
+                for year, info in year_data.items():
+                    sections = info.get('sections', {})
+                    if sections:
+                        sections_path = os.path.join(data_dir, f'{rtype}_{year}_sections.json')
+                        with open(sections_path, 'w', encoding='utf-8') as f:
+                            json.dump(sections, f, ensure_ascii=False, indent=2)
+
     return result
 
 
@@ -477,7 +538,7 @@ def main():
     ALL_DIMS_A = ['announcements', 'financial', 'executives', 'capital',
                   'subsidiary', 'related', 'regulatory', 'structure', 'industry',
                   'peer_compare', 'rd_analysis', 'risk',
-                  'websearch', 'annual_pdf', 'quote',
+                  'websearch', 'annual_pdf', 'periodic_reports', 'quote',
                   'multi_year_trend', 'valuation', 'governance',
                   'share_history', 'institutional', 'earnings_forecast',
                   'investor_qa']

@@ -328,6 +328,216 @@ def get_annual_report_list(stock_code: str, company_name: str = None, years: int
         return []
 
 
+# 定期报告类型映射
+REPORT_CATEGORIES = {
+    'annual': {
+        'cninfo_code': 'category_ndbg_szsh',  # 年报分类码有效
+        'cninfo_searchkey_suffix': '',         # 无需关键词附加，分类码足够
+        'label': '年报',
+        'title_keywords': ['年度报告'],
+        'exclude_keywords': ['摘要', '英文版', 'English'],
+    },
+    'semi_annual': {
+        'cninfo_code': '',                      # category_ydbg_szsh 已失效（返回全量数据）
+        'cninfo_searchkey_suffix': ' 半年度报告', # 改用关键词搜索
+        'label': '半年报',
+        'title_keywords': ['半年度报告', '中期报告'],
+        'exclude_keywords': ['摘要', '英文版', 'English'],
+    },
+    'quarterly': {
+        'cninfo_code': '',                      # category_bdbg_szsh 已失效
+        'cninfo_searchkey_suffix': ' 季度报告',  # 改用关键词搜索
+        'label': '季报',
+        'title_keywords': ['季度报告', '季报'],
+        'exclude_keywords': ['摘要', '英文版', 'English'],
+    },
+}
+
+
+def get_periodic_report_list(stock_code: str, company_name: str = None,
+                             report_type: str = 'all', years: int = 3) -> Dict[str, List[Dict]]:
+    """
+    从 CNINFO 获取定期报告列表（年报+半年报+季报）
+
+    Args:
+        stock_code: 股票代码
+        company_name: 公司名称
+        report_type: 'annual'|'semi_annual'|'quarterly'|'all'
+        years: 获取最近几年
+
+    Returns:
+        {'annual': [...], 'semi_annual': [...], 'quarterly': [...]}
+    """
+    result = {}
+    types = [report_type] if report_type != 'all' else list(REPORT_CATEGORIES.keys())
+
+    for rtype in types:
+        cat_info = REPORT_CATEGORIES.get(rtype)
+        if not cat_info:
+            continue
+        reports = _fetch_cninfo_reports(
+            stock_code, company_name, cat_info, years=years
+        )
+        result[rtype] = reports
+
+    return result
+
+
+def _fetch_cninfo_reports(stock_code, company_name, cat_info, years=3):
+    """从CNINFO获取指定类型报告列表"""
+    url = 'https://www.cninfo.com.cn/new/hisAnnouncement/query'
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
+        'Referer': 'http://www.cninfo.com.cn/new/disclosure/stock',
+        'Origin': 'http://www.cninfo.com.cn',
+        'X-Requested-With': 'XMLHttpRequest',
+        'Content-Type': 'application/x-www-form-urlencoded',
+    }
+    # 年报用分类码过滤，半年报/季报用关键词搜索（分类码已失效）
+    searchkey = (company_name if company_name else stock_code) + cat_info.get('cninfo_searchkey_suffix', '')
+    data = {
+        'tabName': 'fulltext',
+        'category': cat_info.get('cninfo_code', ''),
+        'plate': 'sz',
+        'searchkey': searchkey,
+        'seDate': '',
+        'isHLtitle': 'true',
+        'pageSize': 30,
+    }
+    if stock_code.startswith('6'):
+        data['plate'] = 'sh'
+
+    try:
+        r = requests.post(url, data=data, headers=headers, timeout=15)
+        resp = r.json()
+        announcements = resp.get('announcements') or []
+
+        reports = []
+        for ann in announcements:
+            title = ann.get('announcementTitle', '')
+            # 去除HTML标签
+            import re as _re
+            title_clean = _re.sub(r'<[^>]+>', '', title)
+            # 匹配包含关键词且不含排除词的
+            has_kw = any(kw in title_clean for kw in cat_info['title_keywords'])
+            has_exclude = any(ex in title_clean for ex in cat_info['exclude_keywords'])
+            if has_kw and not has_exclude:
+                adj_url = ann.get('adjunctUrl', '')
+                if adj_url:
+                    year_match = _re.search(r'(\d{4})', title_clean)
+                    year = int(year_match.group(1)) if year_match else None
+                    reports.append({
+                        'year': year,
+                        'title': title_clean,
+                        'pdf_url': f"http://static.cninfo.com.cn/{adj_url}",
+                        'date': ann.get('announcementTime', ''),
+                        'announcement_id': ann.get('announcementId', ''),
+                        'report_type': cat_info['label'],
+                    })
+
+        reports.sort(key=lambda x: x['year'] or 0, reverse=True)
+        # 季报每年4份，多保留一些
+        max_count = years * 4 if '季' in cat_info['label'] else years
+        return reports[:max_count]
+
+    except Exception as e:
+        print(f"[ERROR] _fetch_cninfo_reports({cat_info['label']}): {e}")
+        return []
+
+
+def download_and_extract_periodic(stock_code: str, company_name: str = None,
+                                  save_dir: str = None,
+                                  report_type: str = 'all',
+                                  years: int = 1) -> Dict:
+    """
+    一键下载并提取定期报告（年报+半年报+季报）
+
+    Args:
+        stock_code: 股票代码
+        company_name: 公司名称
+        save_dir: 保存目录
+        report_type: 'annual'|'semi_annual'|'quarterly'|'all'
+        years: 获取最近几年
+
+    Returns:
+        {
+            'reports': {
+                'annual': {year: {sections, text_preview, page_count}},
+                'semi_annual': {...},
+                'quarterly': {...}
+            },
+            'summary': {...}
+        }
+    """
+    from scripts.safe_request import safe_get as _safe_get
+
+    all_reports = get_periodic_report_list(stock_code, company_name, report_type, years)
+    result = {'reports': {}, 'summary': {'total_downloaded': 0, 'errors': []}}
+
+    for rtype, report_list in all_reports.items():
+        if not report_list:
+            result['reports'][rtype] = {'status': 'empty', 'message': f'无{REPORT_CATEGORIES[rtype]["label"]}数据'}
+            continue
+
+        result['reports'][rtype] = {}
+        # 只下载最新一份（除非years>1）
+        for report in report_list[:years]:
+            year = report.get('year')
+            pdf_url = report.get('pdf_url', '')
+            label = REPORT_CATEGORIES[rtype]['label']
+
+            if not pdf_url:
+                continue
+
+            if not save_dir:
+                save_dir = os.path.join(os.getcwd(), 'output', f'{stock_code}_{datetime.now().strftime("%Y%m%d")}', 'data')
+            os.makedirs(save_dir, exist_ok=True)
+
+            pdf_path = os.path.join(save_dir, f'{year}_{rtype}_report.pdf')
+
+            # 下载
+            if not os.path.exists(pdf_path):
+                try:
+                    success = download_pdf(pdf_url, pdf_path)
+                    if not success:
+                        result['summary']['errors'].append(f'{label} {year}年下载失败')
+                        continue
+                except Exception as e:
+                    result['summary']['errors'].append(f'{label} {year}年下载异常: {str(e)[:60]}')
+                    continue
+
+            # 提取文本+章节
+            try:
+                sections = extract_sections(pdf_path)
+                text_preview = extract_text(pdf_path, max_chars=8000)
+                page_count = _count_pages(pdf_path)
+
+                result['reports'][rtype][year] = {
+                    'sections': sections,
+                    'text_preview': text_preview,
+                    'page_count': page_count,
+                    'pdf_path': pdf_path,
+                    'title': report.get('title', ''),
+                }
+                result['summary']['total_downloaded'] += 1
+            except Exception as e:
+                result['summary']['errors'].append(f'{label} {year}年提取失败: {str(e)[:60]}')
+
+    return result
+
+
+def _count_pages(pdf_path):
+    """获取PDF页数"""
+    try:
+        import fitz
+        doc = fitz.open(pdf_path)
+        n = len(doc)
+        doc.close()
+        return n
+    except:
+        return 0
+
+
 # ============================================================
 # PDF下载核心
 # ============================================================

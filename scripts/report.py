@@ -304,18 +304,83 @@ def _section_announcements(data):
     lines.append("## 二、公告全景（近12个月）")
     lines.append(f"")
     lines.append(f"**公告总数**: {data.get('count', 0)}条")
+    
+    # 重要性分级统计
+    stats = data.get('importance_stats', {})
+    if stats:
+        lines.append(f"")
+        lines.append(f"**重要性分级**: ")
+        lines.append(f"- 🔴 CRITICAL（重大事项，已深挖）: {stats.get('critical', 0)}条")
+        lines.append(f"- 🟡 MAJOR（较重要，关注动向）: {stats.get('major', 0)}条")
+        lines.append(f"- 🟢 ROUTINE（常规披露）: {stats.get('routine', 0)}条")
     lines.append(f"")
 
+    # 🔴 CRITICAL公告（含提取内容）
+    critical = data.get('critical_announcements', [])
+    if critical:
+        lines.append("### 🔴 重大事项（CRITICAL）")
+        lines.append(f"")
+        for a in critical:
+            tag = a.get('importance_tag', '')
+            lines.append(f"#### {a.get('date','')[:10]} | {tag}")
+            lines.append(f"{a.get('title','')[:100]}")
+            # 关键事实
+            content = a.get('extracted_content', {})
+            if content and not content.get('error'):
+                facts = content.get('key_facts', [])
+                if facts:
+                    lines.append(f"")
+                    for f in facts:
+                        lines.append(f"- {f}")
+                pages = content.get('page_count', 0)
+                if pages:
+                    lines.append(f"")
+                    lines.append(f"*PDF {pages}页，已提取关键内容*")
+            lines.append(f"")
+
+    # 🟡 MAJOR公告
+    major = data.get('major_announcements', [])
+    if major:
+        lines.append("### 🟡 较重要事项（MAJOR）")
+        lines.append(f"")
+        for a in major[:15]:
+            tag = a.get('importance_tag', '')
+            lines.append(f"- **{a.get('date','')[:10]}** [{tag}] {a.get('title','')[:80]}")
+        if len(major) > 15:
+            lines.append(f"- ... 还有{len(major)-15}条MAJOR公告")
+        lines.append(f"")
+
+    # 📎 事件溯源链
+    chains = data.get('event_chains', {})
+    if chains:
+        lines.append("### 📎 事件溯源链")
+        lines.append(f"")
+        lines.append("*重要事件追溯历史关联公告，理清来龙去脉*")
+        lines.append(f"")
+        for tag, chain in chains.items():
+            chain_anns = chain.get('chain', [])
+            origin = chain.get('origin')
+            lines.append(f"#### {tag}（追溯{chain.get('chain_length',0)}条）")
+            lines.append(f"")
+            if origin:
+                lines.append(f"**源头**: {origin.get('date','')[:10]} | {origin.get('title','')[:80]}")
+                lines.append(f"")
+            for a in chain_anns[:8]:
+                lines.append(f"- {a.get('date','')[:10]} | {a.get('title','')[:80]}")
+            lines.append(f"")
+
+    # 兼容：分类统计（汇总）
     categories = data.get('categories', {})
     if categories:
-        lines.append("**分类统计**:")
-        for cat, anns in sorted(categories.items(), key=lambda x: len(x[1]), reverse=True):
+        lines.append("### 分类统计")
+        lines.append(f"")
+        for cat, anns in sorted(categories.items(), key=lambda x: len(x[1]), reverse=True)[:10]:
             lines.append(f"- {cat}: {len(anns)}条")
         lines.append(f"")
 
-    # 重大事件
+    # 兼容旧 key_events
     key_events = data.get('key_events', [])
-    if key_events:
+    if key_events and not critical:
         lines.append("**重大事件清单**:")
         for e in key_events[:15]:
             lines.append(f"- **{e.get('date','')}** {e.get('title','')[:80]}")

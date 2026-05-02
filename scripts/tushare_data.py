@@ -227,7 +227,10 @@ class TushareData:
             )
             
             if df is None or df.empty:
-                result['error'] = '未来一年无解禁安排'
+                # 无解禁不是error，是正常业务场景
+                result['success'] = True
+                result['data'] = []
+                result['stats'] = {'total_unlocks': 0, 'total_shares': 0, 'note': '当前无解禁安排'}
                 return result
             
             records = []
