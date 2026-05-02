@@ -215,10 +215,11 @@ def fetch_multi_year_trend(stock_code, market="a", data_dir=None, records=None):
     # 现金流质量
     cf_ratios = []
     for i in range(min(3, len(records))):
-        np_ = safe_float(records[i].get("PARENT_NETPROFIT"))
-        oc = safe_float(records[i].get("MGJYXJJE"))
-        if np_ and abs(np_) > 0 and oc is not None:
-            cf_ratios.append(round(oc / np_, 3))
+        eps_ = safe_float(records[i].get("BASIC_EPS"))
+        oc_ps = safe_float(records[i].get("MGJYXJJE"))
+        # 用每股经营现金流/每股收益计算比率（两个都是per-share值，量纲匹配）
+        if eps_ and abs(eps_) > 0.001 and oc_ps is not None:
+            cf_ratios.append(round(oc_ps / eps_, 3))
 
     avg_cf = round(sum(cf_ratios) / len(cf_ratios), 3) if cf_ratios else None
     if avg_cf is None:

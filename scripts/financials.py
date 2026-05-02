@@ -172,6 +172,15 @@ def fetch_financial_metrics(stock_code, market='a', data_dir=None,
 
         result['latest'] = records[0]
 
+        # ====== 补充资产负债表字段（Sina数据源） ======
+        try:
+            balance_data = _supplement_balance_sheet(stock_code, market, records)
+            if balance_data:
+                result['_balance_sheet_source'] = 'sina'
+                print(f"[溯源] ✓ 资产负债表字段已从Sina补充")
+        except Exception as e:
+            result['warnings'].append(f'资产负债表补充失败: {e}')
+
         # 保存JSON
         if data_dir:
             os.makedirs(data_dir, exist_ok=True)
@@ -616,4 +625,87 @@ def fetch_financial_with_trace(stock_code, market='a', data_dir=None):
     )
 
     return result, tracker.get_trace()
+
+
+def _supplement_balance_sheet(stock_code, market, records):
+    """用Sina资产负债表数据补充东方财富缺少的字段
+    
+    东方财富 RPT_LICO_FN_CPD 只返回利润表/现金流表关键字段，
+    缺少：应收账款、其他应收款、总资产、总负债、短期/长期借款等。
+    从新浪财经资产负债表API补充这些字段到 records 中。
+    """
+    try:
+        import akshare as ak
+    except ImportError:
+        return None
+    
+    # Sina股票代码格式：sh/sz/bj + 6位代码
+    if market == 'hk' or market == 'us':
+        return None  # Sina仅支持A股
+    
+    prefix = 'sh' if stock_code[:2] in ['60', '68'] else ('bj' if stock_code[0] in ['8', '4'] else 'sz')
+    sina_code = f'{prefix}{stock_code}'
+    
+    try:
+        df = ak.stock_financial_report_sina(stock=sina_code, symbol="资产负债表")
+    except Exception:
+        return None
+    
+    if df is None or df.empty:
+        return None
+    
+    # Sina列名映射 → EM字段名（兼容cross_validator）
+    field_map = {
+        '应收账款': 'ACCOUNTS_RECE',
+        '其他应收款': 'OTHER_RECE',
+        '其他应收款(合计)': 'OTHER_RECE_TOTAL',
+        '流动资产合计': 'TOTAL_CURRENT_ASSETS',
+        '非流动资产合计': 'TOTAL_NONCURRENT_ASSETS',
+        '短期借款': 'SHORT_LOAN',
+        '长期借款': 'LONG_LOAN',
+        '所有者权益(或股东权益)合计': 'TOTAL_PARENT_EQUITY',
+        '负债和所有者权益(或股东权益)总计': 'TOTAL_ASSETS',
+        '流动负债合计': 'TOTAL_CURRENT_LIAB',
+        '非流动负债合计': 'TOTAL_NONCURRENT_LIAB',
+        '存货': 'INVENTORY',
+        '预付款项': 'PREPAYMENT',
+        '合同资产': 'CONTRACT_ASSETS',
+    }
+    
+    # 按报告日匹配
+    supplemented = 0
+    for rec in records:
+        report_date = str(rec.get('REPORTDATE', ''))[:10]
+        if not report_date:
+            continue
+        
+        # 在Sina数据中找匹配的报告期
+        matched_row = None
+        for _, row in df.iterrows():
+            sina_date_raw = str(row.get('报告日', ''))
+            # Sina日期格式可能为 '20251231' 或 '2025-12-31'，统一处理
+            if len(sina_date_raw) == 8 and sina_date_raw.isdigit():
+                sina_date = f'{sina_date_raw[:4]}-{sina_date_raw[4:6]}-{sina_date_raw[6:8]}'
+            else:
+                sina_date = sina_date_raw[:10]
+            # 匹配逻辑：年-月一致即可（年报/中报/季报）
+            if sina_date and report_date[:7] == sina_date[:7]:
+                matched_row = row
+                break
+        
+        if matched_row is None:
+            continue
+        
+        # 补充缺失字段
+        for sina_col, em_col in field_map.items():
+            if rec.get(em_col) is None and sina_col in matched_row.index:
+                val = matched_row[sina_col]
+                if val is not None and str(val) != 'nan':
+                    try:
+                        rec[em_col] = float(val)
+                        supplemented += 1
+                    except (ValueError, TypeError):
+                        pass
+    
+    return supplemented
 
