@@ -14,7 +14,7 @@
 - 港股CNINFO增加多页翻页（最多5页，每页20条）
 - A股东方财富增加多页翻页（最多5页，每页200条）
 """
-import sys, json, requests, re, time, os
+import sys, json, requests, re, time, os, subprocess
 from datetime import datetime, timedelta
 
 sys.stdout.reconfigure(encoding='utf-8')
@@ -319,10 +319,113 @@ def trace_event_chain(event_tag, all_announcements, event_date_str, max_months=3
 # 三、PDF下载 + 关键内容提取
 # ============================================================
 
+def extract_ann_text_via_browser(stock_code, art_code, max_retries=2):
+    """
+    通过xbrowser打开公告详情页，提取正文文本。
+    东方财富详情页直接渲染了完整公告内容，比PDF下载更可靠。
+    
+    Returns:
+        str: 公告正文文本，失败返回None
+    """
+    # 检测可用浏览器：优先edge（稳定），其次chrome，最后cft
+    _browsers_to_try = ['edge', 'chrome', 'cft']
+    _browser = 'cft'  # 默认
+    XB_SCRIPT = os.path.join(
+        os.environ.get('ProgramFiles', r'C:\Program Files'),
+        'QClaw', 'resources', 'openclaw', 'config', 'skills',
+        'xbrowser', 'scripts', 'xb.cjs'
+    )
+    if not os.path.exists(XB_SCRIPT):
+        return None
+    # 检查浏览器安装状态
+    try:
+        r0 = subprocess.run(['node', XB_SCRIPT, 'status'], capture_output=True, text=True, encoding='utf-8', timeout=10)
+        status_data = json.loads(r0.stdout)
+        browsers_info = status_data.get('data', {}).get('browsers', {})
+        for b in _browsers_to_try:
+            if browsers_info.get(b, {}).get('installed'):
+                _browser = b
+                break
+    except Exception:
+        pass
+    
+    detail_url = f'https://data.eastmoney.com/notices/detail/{stock_code}/{art_code}.html'
+    
+    for attempt in range(max_retries):
+        try:
+            # 1. 打开公告详情页
+            r1 = subprocess.run(
+                ['node', XB_SCRIPT, 'run', '--browser', _browser, 'open', detail_url],
+                capture_output=True, text=True, encoding='utf-8', timeout=25
+            )
+            data1 = json.loads(r1.stdout)
+            if not data1.get('ok'):
+                continue
+            title = data1.get('data',{}).get('result',{}).get('data',{}).get('title','')
+            if not title:
+                continue
+            
+            time.sleep(1.5)  # 等页面渲染
+            
+            # 2. 提取正文：去掉导航/侧栏，只取公告内容区
+            js_extract = (
+                '(function() {'
+                'var main = document.querySelector(".detail-content")'
+                ' || document.querySelector(".newsContent")'
+                ' || document.querySelector("#ContentBody")'
+                ' || document.querySelector(".main-body");'
+                'if (main) return main.innerText;'
+                'var full = document.body.innerText;'
+                'var idx = full.indexOf("公告正文");'
+                'if (idx > 0) return full.slice(idx);'
+                'idx = full.indexOf("公告编号");'
+                'if (idx > 0) return full.slice(idx);'
+                'return full;'
+                '})()'
+            )
+            
+            r2 = subprocess.run(
+                ['node', XB_SCRIPT, 'run', '--browser', _browser, 'eval', js_extract],
+                capture_output=True, text=True, encoding='utf-8', timeout=15
+            )
+            data2 = json.loads(r2.stdout)
+            if not data2.get('ok'):
+                continue
+            # JSON路径: data.result.data.result (xb CLI包装)
+            result_obj = data2.get('data',{}).get('result',{})
+            if isinstance(result_obj, dict):
+                text = result_obj.get('data', {}).get('result', '')
+                if not text:
+                    # 兼容：有时只有 data.result.result
+                    text = result_obj.get('result', '')
+            elif isinstance(result_obj, str):
+                text = result_obj
+            else:
+                text = ''
+            if text and len(str(text)) > 200:
+                raw = str(text)
+                # 裁剪噪声：网友评论、页脚等
+                noise_markers = ['网友评论', '郑重声明', '全部评论', '加载更多', '查看全部评论']
+                for marker in noise_markers:
+                    cut = raw.find(marker)
+                    if cut > 200:  # 至少保留200字正文
+                        raw = raw[:cut]
+                        break
+                return raw
+        except Exception as e:
+            print(f'  [xbrowser提取] 第{attempt+1}次失败: {e}')
+            time.sleep(2)
+    
+    return None
+
+
 def download_announcement_pdf(ann_info, dest_dir, market='a'):
     """
-    下载公告PDF
+    下载公告PDF（兼容新旧art_code格式）
     ann_info: dict with art_code (A股) or announcement_id+adjunct_url (港股)
+    
+    新格式art_code: AN202604161821271212 → PDF在pdf.dfcfw.com
+    旧格式art_code: 纯数字 → PDF在reportimages.eastmoney.com
     """
     os.makedirs(dest_dir, exist_ok=True)
 
@@ -330,6 +433,26 @@ def download_announcement_pdf(ann_info, dest_dir, market='a'):
         art_code = ann_info.get('art_code', '')
         if not art_code or len(art_code) < 10:
             return None
+        
+        # 新格式：AN开头 → pdf.dfcfw.com
+        if art_code.startswith('AN'):
+            pdf_url = f'https://pdf.dfcfw.com/pdf/H2_{art_code}_1.pdf'
+            try:
+                r = requests.get(pdf_url, headers={
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                    'Referer': f'https://data.eastmoney.com/notices/detail/{ann_info.get("stock_code","")}/{art_code}.html',
+                }, timeout=20)
+                if r.status_code == 200 and r.content[:4] == b'%PDF' and len(r.content) > 5000:
+                    dest = os.path.join(dest_dir, f"{art_code}.pdf")
+                    with open(dest, 'wb') as f:
+                        f.write(r.content)
+                    return dest
+            except Exception:
+                pass
+            # PDF下载失败（JS反爬），返回None，由调用方走xbrowser文本提取
+            return None
+        
+        # 旧格式：纯数字 → reportimages
         year = art_code[2:6]
         month = art_code[6:8]
         day = art_code[8:10]
@@ -374,6 +497,32 @@ def download_announcement_pdf(ann_info, dest_dir, market='a'):
             pass
 
     return None
+
+
+def extract_key_content_from_text(text, event_tag):
+    """
+    从纯文本提取关键内容（来自xbrowser页面提取，非PDF）
+    与extract_key_content复用同一套_extract_facts_by_type逻辑
+    
+    Returns:
+        dict: {
+            'full_text_preview': str,   # 前5000字预览
+            'key_facts': list,          # 提取的关键事实
+            'text_length': int,         # 文本长度
+        }
+    """
+    if not text or len(text) < 50:
+        return {'error': '文本内容为空或过短', 'key_facts': []}
+    
+    preview = text[:5000]
+    facts = _extract_facts_by_type(text, event_tag)
+    
+    return {
+        'full_text_preview': preview,
+        'key_facts': facts,
+        'text_length': len(text),
+        'source': 'xbrowser_page_text',
+    }
 
 
 def extract_key_content(pdf_path, event_tag, max_pages=20):
@@ -428,18 +577,27 @@ def _extract_facts_by_type(text, event_tag):
     """根据事件类型从文本中提取关键事实"""
     facts = []
     
-    # 通用提取：金额（要求有万/亿单位，避免匹配页码/序号）
+    # 通用提取：金额（优先带币种/单位的精确匹配）
     amount_patterns = [
-        r'人民币([\d,.]+)\s*亿元',
-        r'人民币([\d,.]+)\s*万元',
-        r'(?:金额|总金额|对价|交易价格|合同金额)[：:\s]*([\d,.]+)\s*[万亿]+元',
+        r'(?:人民币|RMBC?[：:\s]*)([\d,.]+)\s*亿元',
+        r'(?:人民币|RMBC?[：:\s]*)([\d,.]+)\s*万元',
+        r'([\d,.]+)\s*亿美元',
+        r'([\d,.]+)\s*万美元',
+        r'([\d,.]+)\s*美元',
         r'([\d,.]+)\s*亿元',
         r'([\d,.]+)\s*万元',
+        r'(?:金额|总金额|对价|交易价格|合同金额|主张金额)[：:\s]*([\d,.，、]+\s*[万亿]?[美]?元)',
     ]
     for pat in amount_patterns:
-        matches = re.findall(pat, text[:5000])
+        matches = re.findall(pat, text[:8000])
         if matches:
-            facts.append(f"涉及金额: {matches[0]}")
+            # 如果正则已含单位，直接用；否则标注为元
+            m = matches[0]
+            if '美元' in pat or '亿' in pat or '万' in pat:
+                unit = '亿美元' if '亿美元' in pat else ('万美元' if '万美元' in pat else ('美元' if '美元' in pat else ('亿元' if '亿元' in pat else '万元')))
+                facts.append(f"涉及金额: {m}{unit}")
+            else:
+                facts.append(f"涉及金额: {m}")
             break
     
     if '重组' in event_tag or '收购' in event_tag or '出售' in event_tag:
@@ -467,16 +625,31 @@ def _extract_facts_by_type(text, event_tag):
             facts.append(f"合同金额: {contract_amt.group(1).strip()}")
     
     elif '诉讼' in event_tag or '仲裁' in event_tag:
-        # 诉讼类：提取原告、被告、诉求、判决结果
-        plaintiff = re.search(r'原告[：:]\s*([^\n]{2,50})', text)
+        # 诉讼类：提取原告、被告、诉求、涉案金额、受理法院、判决结果
+        plaintiff = re.search(r'(?:^|\n)\s*原告[：:]\s*([^\n，。]{2,80})', text[:8000])
         if plaintiff:
             facts.append(f"原告: {plaintiff.group(1).strip()}")
-        defendant = re.search(r'被告[：:]\s*([^\n]{2,50})', text)
+        defendant = re.search(r'被告[：:\s]*([\s\S]{2,200}?)(?:的(?:股东|侵权|诉讼|合同|重大)|\n\n|。|；)', text[:8000])
         if defendant:
             facts.append(f"被告: {defendant.group(1).strip()}")
-        claim = re.search(r'诉讼请求[：:]\s*([^\n]{5,100})', text)
+        claim = re.search(r'(?:诉讼请求|仲裁请求|请求事项)[：:\s]*([\s\S]{5,600}?)(?:\n\s*\n\s*(?:（|\d+[、.]))', text[:8000])
         if claim:
-            facts.append(f"诉讼请求: {claim.group(1).strip()}")
+            facts.append(f"诉求: {claim.group(1).strip()}")
+        court = re.search(r'(?:受理|管辖)法院[：:\s]*([^\n，。]{2,50})', text[:8000])
+        if court:
+            facts.append(f"受理法院: {court.group(1).strip()}")
+        ruling = re.search(r'(?:判决|裁定|裁决|调解)[结果书][：:\s]*([^\n]{5,200})', text[:8000])
+        if ruling:
+            facts.append(f"判决/裁决: {ruling.group(1).strip()}")
+        # 诉讼金额（更宽泛匹配，含美元）
+        suit_amt = re.search(r'(?:主张|诉请|请求).*?(?:金额|数额|赔偿)[约为不超过]*\s*([\d,.，]+\s*[万亿]?[美]?元)', text[:8000])
+        if suit_amt:
+            facts.append(f"诉请金额: {suit_amt.group(1).strip()}")
+        elif not any('涉及金额' in f for f in facts):
+            # 退而求其次，找大额美元数字
+            usd_match = re.search(r'([\d,.]+)\s*美元', text[:8000])
+            if usd_match:
+                facts.append(f"涉案金额: {usd_match.group(1)}美元")
     
     elif '激励' in event_tag:
         # 股权激励类：提取激励数量、行权价、对象
@@ -631,30 +804,46 @@ def fetch_announcements(stock_code, market='a', data_dir=None,
         else:
             routine_list.append(ann)
     
-    # ---- CRITICAL公告深挖：下载PDF + 提取内容 ----
+    # ---- CRITICAL公告深挖：xbrowser文本提取 > PDF下载 ----
     if deep_extract and data_dir and critical_list:
         pdf_dir = os.path.join(data_dir, 'critical_announcements')
         extracted_count = 0
         for ann in critical_list[:max_critical]:
             try:
-                pdf_path = download_announcement_pdf(ann, pdf_dir, market=market)
-                if pdf_path:
-                    content = extract_key_content(pdf_path, ann.get('importance_tag', ''))
-                    ann['pdf_path'] = pdf_path
+                art_code = ann.get('art_code', '')
+                content = None
+                
+                # 优先方案：xbrowser提取详情页正文（更快、抗反爬）
+                if market == 'a' and art_code:
+                    text = extract_ann_text_via_browser(stock_code, art_code)
+                    if text:
+                        content = extract_key_content_from_text(
+                            text, ann.get('importance_tag', '')
+                        )
+                        ann['extract_method'] = 'xbrowser'
+                        ann['detail_url'] = f'https://data.eastmoney.com/notices/detail/{stock_code}/{art_code}.html'
+                
+                # 备选方案：下载PDF + PyMuPDF提取
+                if not content:
+                    pdf_path = download_announcement_pdf(ann, pdf_dir, market=market)
+                    if pdf_path:
+                        content = extract_key_content(pdf_path, ann.get('importance_tag', ''))
+                        ann['pdf_path'] = pdf_path
+                        ann['extract_method'] = 'pdf'
+                
+                if content:
                     ann['extracted_content'] = content
                     extracted_count += 1
                     print(f"  [深挖] {ann.get('date','')[:10]} {ann.get('title','')[:50]} → {content.get('key_facts', [])}")
                 else:
-                    ann['pdf_path'] = None
-                    ann['extracted_content'] = {'error': 'PDF下载失败'}
+                    ann['extracted_content'] = {'error': '文本提取失败（xbrowser+PDF均不可用）'}
             except Exception as e:
-                ann['pdf_path'] = None
                 ann['extracted_content'] = {'error': str(e)}
         
         steps.append({
             'step': 'deep_extract',
             'label': 'CRITICAL公告深挖',
-            'source': 'em_pdf + PyMuPDF',
+            'source': 'xbrowser + pdf_fallback',
             'count': extracted_count,
             'status': 'OK' if extracted_count > 0 else 'SKIP',
         })
