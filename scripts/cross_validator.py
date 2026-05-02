@@ -47,6 +47,64 @@ class CrossValidator:
         self.signals = []
         self.hidden_truths = []
 
+        # 统一加载年报章节数据（兼容 annual_extract 和 annual_pdf 两种来源）
+        self.annual_data = self._load_annual_data()
+
+    def _load_annual_data(self):
+        """从 findings 中加载年报提取数据
+
+        优先级：annual_extract > annual_pdf.sections > data_dir/annual_report_sections.json
+        """
+        # 1. 直接从 annual_extract 获取（旧流程）
+        ae = self.findings.get('annual_extract', {})
+        if ae and any(ae.get(k) for k in ['top5_customers', 'top5_suppliers', 'guarantee', 'related_transactions']):
+            return ae
+
+        # 2. 从 annual_pdf.sections 提取关键字段
+        ap = self.findings.get('annual_pdf', {})
+        sections = ap.get('sections', {}) if isinstance(ap, dict) else {}
+        if sections:
+            def _sec_content(v):
+                """sections值可能是str或dict{'name':..,'content':..}，统一提取content"""
+                if isinstance(v, dict):
+                    return v.get('content', '')
+                return v or ''
+            return {
+                'top5_customers': _sec_content(sections.get('top5_customers')),
+                'top5_suppliers': _sec_content(sections.get('top5_suppliers')),
+                'guarantee': _sec_content(sections.get('guarantee')),
+                'related_transactions': _sec_content(sections.get('related_transactions')),
+                'litigation_detail': _sec_content(sections.get('litigation_detail')) + '\n' + _sec_content(sections.get('litigation', '')) + '\n' + _sec_content(sections.get('contingent', '')),
+                'audit': _sec_content(sections.get('audit')),
+                'subsidiaries': _sec_content(sections.get('subsidiaries')),
+            }
+
+        # 3. 从文件加载
+        data_dir = self.findings.get('_data_dir', '') or self.findings.get('_meta', {}).get('data_dir', '')
+        if data_dir:
+            sp = os.path.join(data_dir, 'annual_report_sections.json')
+            if os.path.exists(sp):
+                try:
+                    with open(sp, 'r', encoding='utf-8') as f:
+                        sec = json.load(f)
+                    def _sc(v):
+                        if isinstance(v, dict):
+                            return v.get('content', '')
+                        return v or ''
+                    return {
+                        'top5_customers': _sc(sec.get('top5_customers')),
+                        'top5_suppliers': _sc(sec.get('top5_suppliers')),
+                        'guarantee': _sc(sec.get('guarantee')),
+                        'related_transactions': _sc(sec.get('related_transactions')),
+                        'litigation_detail': _sc(sec.get('litigation_detail')),
+                        'audit': _sc(sec.get('audit')),
+                        'subsidiaries': _sc(sec.get('subsidiaries')),
+                    }
+                except Exception:
+                    pass
+
+        return {}
+
     # ═══════════════════════════════════════════════
     #  公开接口
     # ═══════════════════════════════════════════════
@@ -59,6 +117,7 @@ class CrossValidator:
         self._rule_hidden_debt()
         self._rule_info_manipulation()
         self._rule_governance_flaw()
+        self._rule_nominee_detection()
         self._synthesize()
         return self._build_result()
 
@@ -184,7 +243,7 @@ class CrossValidator:
                 'detail': r.get('risk', str(r))[:80]
             })
 
-        annual_data = self.findings.get('annual_extract', {})
+        annual_data = self.annual_data
         top5_supp = annual_data.get('top5_suppliers', '')
         if top5_supp and '集中' in str(top5_supp):
             transfer_signals.append({
@@ -203,7 +262,7 @@ class CrossValidator:
         related = self.findings.get('related', {})
         governance = self.findings.get('governance', {})
         financial = self.findings.get('financial', {})
-        annual_data = self.findings.get('annual_extract', {})
+        annual_data = self.annual_data
 
         # --- 2.1 隐性关联交易 ---
         overlap_signals = []
@@ -388,7 +447,7 @@ class CrossValidator:
         financial = self.findings.get('financial', {})
         related = self.findings.get('related', {})
         cap = self.findings.get('capital', {})
-        annual_data = self.findings.get('annual_extract', {})
+        annual_data = self.annual_data
         trend = self.findings.get('multi_year_trend', {})
 
         # --- 4.1 表外担保 ---
@@ -428,6 +487,47 @@ class CrossValidator:
 
         for sig in guarantee_signals:
             self.signals.append({**sig, 'category': '隐藏负债', 'type': '表外担保'})
+
+        # --- 4.1b 重大未决诉讼/仲裁（可能构成隐藏负债） ---
+        litigation_text = str(annual_data.get('litigation_detail', ''))
+        if litigation_text and len(litigation_text) > 50:
+            # 提取金额（支持美元/人民币/亿/万/逗号分隔数字）
+            # 格式1: "6.89亿美元" / "3亿人民币"
+            cny_yi = re.findall(r'(\d+(?:\.\d+)?)\s*亿美元', litigation_text)
+            cny_yi2 = re.findall(r'(\d+(?:\.\d+)?)\s*亿人民币', litigation_text)
+            # 格式2: "689,018,524 美元" (逗号分隔完整数字+美元)
+            usd_full = re.findall(r'(\d{1,3}(?:,\d{3})+(?:\.\d+)?)\s*美元', litigation_text)
+            # 格式3: "USD 689018524"
+            usd_amounts = re.findall(r'USD\s*(\d+(?:,\d+)*(?:\.\d+)?)', litigation_text, re.IGNORECASE)
+            all_yi = []
+            for a in cny_yi + cny_yi2:
+                try: all_yi.append(float(a))
+                except: pass
+            for a in usd_full + usd_amounts:
+                try: all_yi.append(float(a.replace(',', '')) / 1e8 * 7.2)  # USD→亿人民币
+                except: pass
+            # 格式4: "XX万元" 转换
+            wan_amounts = re.findall(r'(\d+(?:,\d+)*)\s*万元', litigation_text)
+            for a in wan_amounts:
+                try: all_yi.append(float(a.replace(',', '')) / 10000)  # 万元→亿
+                except: pass
+
+            if all_yi:
+                max_lit = max(all_yi)
+                fin_records = financial.get('records', [])
+                if fin_records:
+                    total_equity = self._sf(fin_records[0].get('TOTAL_PARENT_EQUITY'))
+                    if total_equity and total_equity > 0:
+                        eq_yi = total_equity / 1e8
+                        lit_ratio = max_lit / eq_yi
+                        strength = 'strong' if lit_ratio > 0.2 else ('medium' if lit_ratio > 0.1 else 'weak')
+                        if lit_ratio > 0.05:
+                            self.signals.append({
+                                'id': 'D1C', 'strength': strength,
+                                'dim': '重大诉讼/仲裁',
+                                'detail': f'未决诉讼/仲裁最大金额约{max_lit:.1f}亿，占净资产{lit_ratio:.0%}',
+                                'category': '隐藏负债', 'type': '表外担保'
+                            })
 
         # --- 4.2 隐性杠杆 ---
         leverage_signals = []
@@ -575,6 +675,108 @@ class CrossValidator:
             self.signals.append({**sig, 'category': '治理缺陷', 'type': t})
 
     # ═══════════════════════════════════════════════
+    #  Rule 7: 关联方代持/名义股东检测
+    # ═══════════════════════════════════════════════
+
+    def _rule_nominee_detection(self):
+        """基于工商和股东数据的关联方代持检测
+        
+        检测逻辑：
+        1. 前五客户/供应商与大股东/子公司名称重叠 → 隐性关联
+        2. 子公司/关联方与客户/供应商名称交叉 → 代持嫌疑
+        3. 股东变更+客户集中度变化同步 → 名义股东嫌疑
+        """
+        governance = self.findings.get('governance', {})
+        related = self.findings.get('related', {})
+        annual_data = self.annual_data
+        subsidiary = self.findings.get('subsidiary', {})
+        share_hist = self.findings.get('share_history', {})
+
+        nominee_signals = []
+
+        # 7.1 大股东名称 × 客户/供应商名单
+        top_sh = governance.get('top_shareholders', [])
+        sh_names = [s.get('name', '') for s in top_sh if s.get('name') and len(s.get('name', '')) >= 2]
+        
+        # 从年报提取中获取客户/供应商
+        top5_cust = str(annual_data.get('top5_customers', ''))
+        top5_supp = str(annual_data.get('top5_suppliers', ''))
+        
+        # 从关联交易公告中提取公司名称
+        related_deals = related.get('deals', [])
+        related_names = set()
+        for d in related_deals:
+            title = str(d.get('title', ''))
+            # 提取公告标题中的公司名（简化：取「关于」和「的」之间的文本）
+            for m in re.findall(r'关于(.+?)(?:的|暨)', title):
+                for name in m.split('与'):
+                    name = name.strip()
+                    if len(name) >= 3:
+                        related_names.add(name)
+        
+        # 7.2 子公司名称 × 客户/供应商
+        subsidiaries = subsidiary.get('subsidiaries', [])
+        sub_names = [s.get('name', '') for s in subsidiaries if s.get('name') and len(s.get('name', '')) >= 2]
+        
+        # 交叉比对
+        overlap_with_cust = []
+        overlap_with_supp = []
+        
+        for name in sh_names + sub_names[:10]:  # 限制检查范围
+            # 与客户名单比对（模糊匹配：名3字以上子串）
+            if name in top5_cust:
+                overlap_with_cust.append(name)
+            elif len(name) >= 3 and any(name in c or c in name for c in top5_cust.split('\n') if len(c.strip()) >= 3):
+                overlap_with_cust.append(name)
+            
+            # 与供应商名单比对
+            if name in top5_supp:
+                overlap_with_supp.append(name)
+            elif len(name) >= 3 and any(name in s or s in name for s in top5_supp.split('\n') if len(s.strip()) >= 3):
+                overlap_with_supp.append(name)
+        
+        if overlap_with_cust:
+            nominee_signals.append({
+                'id': 'N1A', 'strength': 'strong',
+                'dim': '股东/子公司×客户',
+                'detail': f'以下名称同时出现在客户名单中: {", ".join(overlap_with_cust[:5])}'
+            })
+        
+        if overlap_with_supp:
+            nominee_signals.append({
+                'id': 'N1B', 'strength': 'strong',
+                'dim': '股东/子公司×供应商',
+                'detail': f'以下名称同时出现在供应商名单中: {", ".join(overlap_with_supp[:5])}'
+            })
+        
+        # 7.3 关联交易对象 × 客户/供应商
+        for rname in list(related_names)[:20]:
+            if len(rname) >= 3 and rname in top5_cust:
+                nominee_signals.append({
+                    'id': 'N2A', 'strength': 'medium',
+                    'dim': '关联方×客户',
+                    'detail': f'关联交易对象"{rname}"同时出现在前五客户中'
+                })
+            if len(rname) >= 3 and rname in top5_supp:
+                nominee_signals.append({
+                    'id': 'N2B', 'strength': 'medium',
+                    'dim': '关联方×供应商',
+                    'detail': f'关联交易对象"{rname}"同时出现在前五供应商中'
+                })
+        
+        # 7.4 股东变更+客户变化同步
+        equity_changes = share_hist.get('equity_changes', [])
+        if len(equity_changes) >= 3 and (overlap_with_cust or overlap_with_supp):
+            nominee_signals.append({
+                'id': 'N3A', 'strength': 'medium',
+                'dim': '股东变更×客户重叠',
+                'detail': f'近期{len(equity_changes)}次股东变更+客户/供应商与股东名称重叠，名义股东嫌疑'
+            })
+        
+        for sig in nominee_signals:
+            self.signals.append({**sig, 'category': '利益输送', 'type': '关联方代持'})
+
+    # ═══════════════════════════════════════════════
     #  信号合成：将原始信号合成为隐情结论
     # ═══════════════════════════════════════════════
 
@@ -711,6 +913,12 @@ class CrossValidator:
                 f"**审计独立性存疑**（{level}）："
                 f"在关联交易频繁+高管异动的情况下获得标准审计意见，"
                 f"审计师可能未充分执行审计程序。",
+
+            ('利益输送', '关联方代持'):
+                f"**关联方代持嫌疑**（{level}）："
+                f"股东/子公司/关联交易对象与前五客户/供应商存在名称重叠，"
+                f"可能存在未披露的关联方代持交易。"
+                f"需核查相关方的实际控制人和工商登记信息。",
         }
 
         key = (category, type_)
