@@ -44,6 +44,7 @@ from scripts.earnings_forecast import fetch_earnings_forecast
 from scripts.investor_qa import fetch_investor_qa
 from scripts.company_resolver import resolve_company_name, format_resolver_summary
 from scripts.hkex_announcements import search_hkex_announcements
+from scripts.cross_validator import CrossValidator
 
 
 def parse_args():
@@ -103,6 +104,9 @@ def call_dim(dim, stock, market, data_dir, results, args):
         return fetch_industry(stock, market, data_dir)
     elif dim == 'risk':
         return assess_risk(results['findings'])
+    elif dim == 'cross_validation':
+        cv = CrossValidator(results['findings'], stock, market)
+        return cv.validate()
     elif dim == 'websearch':
         return fetch_websearch(stock, data_dir)
     elif dim == 'annual_pdf':
@@ -262,7 +266,7 @@ def dim_summary(dim, result):
             return f"批量行情: {total}只 [{ok}只交易中]"
         return f"批量结果: {total}项"
     summaries = {
-        'announcements': f"公告{result.get('count',0)}条 | CRITICAL:{result.get('importance_stats',{}).get('critical',0)} MAJOR:{result.get('importance_stats',{}).get('major',0)} ROUTINE:{result.get('importance_stats',{}).get('routine',0)} | 溯源链:{len(result.get('event_chains',{}))}条"
+        'announcements': f"公告{result.get('count',0)}条 | CRITICAL:{result.get('importance_stats',{}).get('critical',0)} MAJOR:{result.get('importance_stats',{}).get('major',0)} ROUTINE:{result.get('importance_stats',{}).get('routine',0)} | 溯源链:{len(result.get('event_chains',{}))}条",
         'financial': f"审计意见: {result.get('audit_opinion','未知')}",
         'executives': f"发现 {result.get('change_count',0)} 条高管变动",
         'capital': f"发现 {result.get('count',0)} 项资金动作",
@@ -541,7 +545,7 @@ def main():
                   'websearch', 'annual_pdf', 'periodic_reports', 'quote',
                   'multi_year_trend', 'valuation', 'governance',
                   'share_history', 'institutional', 'earnings_forecast',
-                  'investor_qa']
+                  'investor_qa', 'cross_validation']
     ALL_DIMS_HK = ['announcements', 'hk_financial', 'hkex_announcements', 'industry', 'risk', 'quote',
                   'multi_year_trend', 'valuation']
     ALL_DIMS_US = [

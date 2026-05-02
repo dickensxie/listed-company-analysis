@@ -166,6 +166,10 @@ def generate_report(results, out_dir):
     if 'risk' in results['dims']:
         lines += _section_risk(findings['risk'])
 
+    # ==================== 第十三点五部分：跨维度交叉验证（隐情发现） ====================
+    if 'cross_validation' in results['dims'] and 'cross_validation' in findings:
+        lines += _section_cross_validation(findings['cross_validation'])
+
     # ==================== 第十四部分：战略意图分析 ====================
     lines += _section_strategy(stock, findings)
 
@@ -823,6 +827,43 @@ def _section_risk(data):
         lines.append(f"**🟡 中风险信号 ({len(medium)}项)**:")
         for s in medium:
             lines.append(f"- {s['detail']}")
+        lines.append(f"")
+
+    return lines
+
+
+def _section_cross_validation(data):
+    """跨维度交叉验证隐情发现报告"""
+    lines = []
+    lines.append("## 十三.五、🔍 跨维度交叉验证：隐情发现")
+    lines.append(f"")
+
+    summary = data.get('summary', {})
+    score = summary.get('score', 0)
+    overall = summary.get('overall', '未知')
+    lines.append(f"**隐情评分**: {score}/100 | {overall}")
+    lines.append(f"")
+    lines.append(f"> 每条隐情均由≥2个独立维度信号支撑。隐情发现不等同于事实认定，仅为投资研究参考。")
+    lines.append(f"")
+
+    hidden_truths = data.get('hidden_truths', [])
+    if not hidden_truths:
+        lines.append(f"🟢 **暂无重大隐情** — 各维度交叉验证未发现显著异常组合。单维度预警请参考风险评级章节。")
+        lines.append(f"")
+        return lines
+
+    for t in hidden_truths:
+        lines.append(f"### {t['level']} {t['category']} → {t['type']}")
+        lines.append(f"")
+        lines.append(t.get('narrative', ''))
+        lines.append(f"")
+        lines.append(f"<details><summary>支撑信号（{t['signal_count']}个）</summary>")
+        lines.append(f"")
+        for sig in t.get('signals', []):
+            icon = {'strong': '🔴', 'medium': '🟠', 'weak': '🟡'}.get(sig['strength'], '⚪')
+            lines.append(f"- {icon} [{sig['dim']}] {sig['detail']}")
+        lines.append(f"")
+        lines.append(f"</details>")
         lines.append(f"")
 
     return lines
